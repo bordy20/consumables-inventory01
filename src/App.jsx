@@ -1,21 +1,8 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
-
-// ─── Config ────────────────────────────────────────────────────────────────────
-const STORE_KEY   = "cons-v10";
-const USER_ID_KEY = "cons-uid";
-
-function getUserId() {
-  let id = localStorage.getItem(USER_ID_KEY);
-  if (!id) {
-    id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-    localStorage.setItem(USER_ID_KEY, id);
-  }
-  return id;
-}
-const CATS  = ["Oral Care","Toilet Paper","Personal Care","Cleaning","Food & Beverage","Medicine","Other"];
-const UNITS = ["piece","pack","bottle","tube","roll","bar","box","can","bag","sachet","set","pair"];
-const C_ICO = {"Oral Care":"🦷","Toilet Paper":"🧻","Personal Care":"🧴","Cleaning":"🧹","Food & Beverage":"🥫","Medicine":"💊","Other":"📦"};
-const C_CLR = {"Oral Care":"#3b82f6","Toilet Paper":"#8b5cf6","Personal Care":"#ec4899","Cleaning":"#10b981","Food & Beverage":"#f59e0b","Medicine":"#ef4444","Other":"#6b7280"};
+import { createSync, apiFetch, setAccessCode, LOCKED_EVENT } from "./sync.js";
+import { nid, localISO, esc, CATS, C_ICO, C_CLR, stockState } from "./shared.js";
+import { Icon, Toast, Sheet, Stepper, ItemForm, EditForm, ShopTab, LockScreen, SettingsModal } from "./ui.jsx";
+import "./styles.css";
 
 // ─── Smart local product keyword database ─────────────────────────────────────
 const PRODUCT_DB = [
@@ -155,11 +142,8 @@ async function compressImage(dataUrl, maxPx = 800, quality = 0.85) {
 async function aiScan(dataUrl) {
   const { dataUrl: compressed } = await compressImage(dataUrl);
   const b64 = compressed.split(",")[1];
-  const response = await fetch("/api/scan", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ image: b64 }),
-  });
+  const response = await apiFetch("/api/scan", { method: "POST", body: JSON.stringify({ image: b64 }) });
+  if (!response.ok) return null;
   const obj = await response.json();
   if (obj.error || !obj.name) return null;
   return obj;
@@ -184,253 +168,30 @@ async function scanPipeline(dataUrl, filename) {
 }
 
 async function aiChat(messages, inventory) {
-  const res = await fetch("/api/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages, inventory }),
-  });
+  const res = await apiFetch("/api/chat", { method: "POST", body: JSON.stringify({ messages, inventory }) });
+  if (!res.ok) throw new Error("chat " + res.status);          // → caller falls back to the offline answer
   const data = await res.json();
-  return data.reply || null;
+  if (!data.reply && !(data.actions || []).length) throw new Error("empty reply");
+  return { reply: data.reply || "", actions: data.actions || [] };
 }
 
-// ─── Cloud Storage (Vercel KV) with local cache fallback ─────────────────────
-const db = {
-  // Load: try cloud first, fall back to localStorage cache if offline
-  async load(uid) {
-    try {
-      const res = await fetch("/api/inventory?userId=" + uid);
-      if (res.ok) {
-        const data = await res.json();
-        if (data && Array.isArray(data.items)) {
-          localStorage.setItem(STORE_KEY, JSON.stringify(data));
-          return data;
-        }
-      }
-    } catch {}
-    try { const c = localStorage.getItem(STORE_KEY); return c ? JSON.parse(c) : null; } catch { return null; }
-  },
-  // Save: local cache instantly + cloud in background
-  save(uid, data) {
-    try { localStorage.setItem(STORE_KEY, JSON.stringify(data)); } catch {}
-    fetch("/api/inventory?userId=" + uid, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    }).catch(() => {});
-  },
-};
-
-// ─── Reusable UI ───────────────────────────────────────────────────────────────
-function Toast({ list }) {
-  return (
-    <div style={{ position:"fixed", top:8, left:8, right:8, zIndex:9999, display:"flex", flexDirection:"column", gap:6, pointerEvents:"none" }}>
-      {list.map(t => (
-        <div key={t.id} style={{ padding:"8px 13px", borderRadius:10, fontSize:12, fontWeight:600, backdropFilter:"blur(10px)", boxShadow:"0 4px 18px rgba(0,0,0,.5)", animation:"slideIn .3s ease", border:"1px solid rgba(255,255,255,0.07)",
-          background: t.type==="danger"?"rgba(239,68,68,.92)":t.type==="warn"?"rgba(245,158,11,.92)":t.type==="info"?"rgba(59,130,246,.92)":"rgba(16,185,129,.92)",
-          color: t.type==="danger"||t.type==="info"?"#fff":t.type==="warn"?"#1a0f00":"#001a0e"
-        }}>{t.msg}</div>
-      ))}
-    </div>
-  );
-}
-
-function Modal({ onClose, children }) {
-  return (
-    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,.78)", zIndex:8888, display:"flex", alignItems:"center", justifyContent:"center", padding:16, backdropFilter:"blur(4px)" }}
-      onClick={e => e.target === e.currentTarget && onClose()}>
-      <div style={{ background:"#0c1828", border:"1px solid rgba(255,255,255,0.07)", borderRadius:18, padding:22, width:"100%", maxWidth:340, maxHeight:"90vh", overflowY:"auto" }}>
-        {children}
-      </div>
-    </div>
-  );
-}
-
-function Field({ label, children }) {
-  return <div style={{ marginBottom:10 }}><div style={{ fontSize:11, color:"#5a7898", marginBottom:3 }}>{label}</div>{children}</div>;
-}
-
-function Stepper({ value, onChange, min = 0 }) {
-  return (
-    <div style={{ display:"flex", alignItems:"center", gap:8 }}>
-      <button style={st.sb} onClick={() => onChange(Math.max(min, value - 1))}>−</button>
-      <span style={{ fontSize:18, fontWeight:700, minWidth:30, textAlign:"center" }}>{value}</span>
-      <button style={st.sb} onClick={() => onChange(value + 1)}>+</button>
-    </div>
-  );
-}
-
-// ─── ItemForm — used for scan confirm + manual add + edit ──────────────────────
-function ItemForm({ image, prefill, isAI, title, onSave, onCancel }) {
-  const [name,     setName]     = useState(prefill?.name     || "");
-  const [brand,    setBrand]    = useState(prefill?.brand    || "");
-  const [category, setCategory] = useState(prefill?.category || "Personal Care");
-  const [unit,     setUnit]     = useState(prefill?.unit     || "piece");
-  const [qty,      setQty]      = useState(prefill?.qty      || 1);
-  const [minQty,   setMinQty]   = useState(prefill?.minQty   || 1);
-  const [expiry,   setExpiry]   = useState(prefill?.expiry   || "");
-  const [notes,    setNotes]    = useState(prefill?.notes    || "");
-
-  const ok = name.trim().length > 0;
-  const save = () => onSave({ name:name.trim(), brand, category, unit, qty, minQty, expiry, notes, emoji: C_ICO[category]||"📦" });
-
-  return (
-    <div style={{ width:"100%", paddingBottom:8 }}>
-      <div style={{ fontSize:15, fontWeight:700, textAlign:"center", marginBottom:12 }}>{title}</div>
-      {image && <img src={image} alt="" style={{ width:"100%", maxHeight:150, objectFit:"contain", borderRadius:10, marginBottom:10, background:"rgba(0,0,0,.25)" }} />}
-      {isAI && <div style={{ fontSize:12, color:"#6ee7b7", background:"rgba(16,185,129,.08)", border:"1px solid rgba(16,185,129,.2)", borderRadius:8, padding:"7px 11px", marginBottom:12, textAlign:"center" }}>🤖 AI detected — review and confirm</div>}
-      <Field label="Product Name *">
-        <input style={st.inp} value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. Colgate Toothpaste" />
-      </Field>
-      <Field label="Brand">
-        <input style={st.inp} value={brand} onChange={e=>setBrand(e.target.value)} placeholder="Optional" />
-      </Field>
-      <Field label="Category">
-        <select style={st.inp} value={category} onChange={e=>{ setCategory(e.target.value); }}>
-          {CATS.map(c => <option key={c}>{c}</option>)}
-        </select>
-      </Field>
-      <div style={{ display:"flex", gap:10 }}>
-        <Field label="Quantity"><Stepper value={qty} onChange={setQty} min={1} /></Field>
-        <Field label="Unit">
-          <select style={st.inp} value={unit} onChange={e=>setUnit(e.target.value)}>
-            {UNITS.map(u => <option key={u}>{u}</option>)}
-          </select>
-        </Field>
-      </div>
-      <div style={{ display:"flex", gap:10 }}>
-        <Field label="Alert when ≤">
-          <input style={st.inp} type="number" min="0" value={minQty} onChange={e=>setMinQty(+e.target.value||1)} />
-        </Field>
-        <Field label="Expiry Date">
-          <input style={st.inp} type="date" value={expiry} onChange={e=>setExpiry(e.target.value)} />
-        </Field>
-      </div>
-      <div style={{ display:"flex", gap:8, marginTop:8 }}>
-        <button style={{ ...st.btnGreen, flex:1, opacity:ok?1:0.4 }} disabled={!ok} onClick={save}>
-          ✅ Add to Inventory
-        </button>
-        <button style={{ ...st.btnGhost, flex:"none", padding:"0 16px" }} onClick={onCancel}>✕</button>
-      </div>
-    </div>
-  );
-}
-
-// ─── EditForm — separate component so hooks are always called ──────────────────
-function EditForm({ item, onSave, onCancel }) {
-  const [name,     setName]     = useState(item.name);
-  const [brand,    setBrand]    = useState(item.brand    || "");
-  const [category, setCategory] = useState(item.category || "Personal Care");
-  const [unit,     setUnit]     = useState(item.unit     || "piece");
-  const [minQty,   setMinQty]   = useState(item.minQty   || 1);
-  const [expiry,   setExpiry]   = useState(item.expiry   || "");
-  const save = () => onSave({ ...item, name, brand, category, unit, minQty, expiry, emoji: C_ICO[category]||"📦" });
-  return (
-    <>
-      <div style={{ fontSize:15, fontWeight:700, marginBottom:12 }}>✏️ Edit — {item.name}</div>
-      <Field label="Name"><input style={st.inp} value={name} onChange={e=>setName(e.target.value)} /></Field>
-      <Field label="Brand"><input style={st.inp} value={brand} onChange={e=>setBrand(e.target.value)} placeholder="Optional" /></Field>
-      <Field label="Category">
-        <select style={st.inp} value={category} onChange={e=>setCategory(e.target.value)}>
-          {CATS.map(c=><option key={c}>{c}</option>)}
-        </select>
-      </Field>
-      <div style={{ display:"flex", gap:10 }}>
-        <Field label="Unit"><select style={st.inp} value={unit} onChange={e=>setUnit(e.target.value)}>{UNITS.map(u=><option key={u}>{u}</option>)}</select></Field>
-        <Field label="Alert ≤"><input style={st.inp} type="number" min="0" value={minQty} onChange={e=>setMinQty(+e.target.value||1)} /></Field>
-      </div>
-      <Field label="Expiry"><input style={st.inp} type="date" value={expiry} onChange={e=>setExpiry(e.target.value)} /></Field>
-      <div style={{ display:"flex", gap:8, marginTop:14 }}>
-        <button style={{ ...st.btnGreen, flex:1 }} onClick={save}>💾 Save</button>
-        <button style={{ ...st.btnGhost, flex:1 }} onClick={onCancel}>Cancel</button>
-      </div>
-    </>
-  );
-}
-
-// ─── ShopTab — separate component so hooks are always called ──────────────────
-function ShopTab({ items, shopList, setShopList }) {
-  const [sName, setSName] = useState("");
-  const [sQty,  setSQty]  = useState(1);
-
-  const suggested = items.filter(i => i.qty <= (i.minQty||1) && !shopList.find(l => l.name.toLowerCase() === i.name.toLowerCase()));
-
-  const addShop = (n, q=1) => {
-    if (!n.trim()) return;
-    const idx = shopList.findIndex(l => l.name.toLowerCase() === n.toLowerCase());
-    setShopList(idx >= 0
-      ? shopList.map((l, i) => i===idx ? { ...l, qty: l.qty+q } : l)
-      : [...shopList, { name: n.trim(), qty: q }]
-    );
-    setSName(""); setSQty(1);
-  };
-
-  const exportList = () => {
-    const a = document.createElement("a");
-    a.href = "data:text/plain;charset=utf-8," + encodeURIComponent("SHOPPING LIST\n" + new Date().toLocaleDateString() + "\n\n" + shopList.map(i=>`${i.checked?"✓":"○"} ${i.name}  ×${i.qty}`).join("\n"));
-    a.download = "shopping-list.txt"; a.click();
-  };
-
-  return (
-    <div style={{ padding:14 }}>
-      {suggested.length > 0 && (
-        <div style={st.card}>
-          <div style={st.cardHd}>⚡ Suggested (low stock)</div>
-          {suggested.map(i => (
-            <div key={i.id} style={st.row}>
-              <span>{i.emoji} {i.name} — {i.qty} left</span>
-              <button style={st.chipBtn} onClick={() => addShop(i.name, Math.max(1, i.minQty||2))}>+ Add</button>
-            </div>
-          ))}
-        </div>
-      )}
-      <div style={st.card}>
-        <div style={st.cardHd}>➕ Add Item</div>
-        <div style={{ display:"flex", gap:7 }}>
-          <input style={{ ...st.inp, flex:1 }} placeholder="Item name…" value={sName} onChange={e=>setSName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addShop(sName,sQty)} />
-          <Stepper value={sQty} onChange={setSQty} min={1} />
-          <button style={{ ...st.btnBlue, padding:"0 14px", flexShrink:0 }} onClick={()=>addShop(sName,sQty)}>+</button>
-        </div>
-      </div>
-      {shopList.length > 0 ? (
-        <div style={st.card}>
-          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
-            <div style={st.cardHd}>🛒 List ({shopList.length})</div>
-            <div style={{ display:"flex", gap:6 }}>
-              {shopList.some(i=>i.checked) && <button style={st.tinyBtn} onClick={()=>setShopList(shopList.filter(i=>!i.checked))}>Clear ✓</button>}
-              <button style={st.tinyBtn} onClick={exportList}>Export 📤</button>
-            </div>
-          </div>
-          {shopList.map((item, idx) => (
-            <div key={idx} style={{ ...st.row, opacity: item.checked?0.4:1 }}>
-              <button style={st.mb} onClick={()=>setShopList(shopList.map((l,i)=>i===idx?{...l,checked:!l.checked}:l))}>
-                {item.checked?"✅":"⬜"}
-              </button>
-              <span style={{ flex:1, textDecoration:item.checked?"line-through":"none", fontSize:13 }}>{item.name}</span>
-              <span style={{ color:"#60a5fa", fontSize:12, marginRight:8 }}>×{item.qty}</span>
-              <button style={st.mb} onClick={()=>setShopList(shopList.filter((_,i)=>i!==idx))}>✕</button>
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div style={{ textAlign:"center", padding:"48px 20px", color:"#5a7898" }}>
-          <div style={{ fontSize:40 }}>🛒</div>
-          <p style={{ marginTop:10, fontSize:13 }}>Shopping list is empty</p>
-        </div>
-      )}
-    </div>
-  );
-}
 
 // ─── Main App ──────────────────────────────────────────────────────────────────
 export default function App() {
   // All state at top level — no hooks inside JSX
   const [items,    setItems]    = useState([]);
   const [shopList, setShopList] = useState([]);
+  const [tomb,     setTomb]     = useState([]);          // deleted-item markers for multi-device merge
+  const [shopU,    setShopU]    = useState(0);           // shopping list last-modified
   const [loaded,   setLoaded]   = useState(false);
   const [tab,      setTab]      = useState("home");
+  const [syncStatus,   setSyncStatus]   = useState("loading");
+  const [syncDetail,   setSyncDetail]   = useState("");
+  const [locked,       setLocked]       = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
 
   // Chat
-  const [msgs,      setMsgs]      = useState([{ role:"assistant", id:0, text:"👋 Hi! I'm **Consumables AI**.\n\n📷 **Scan** — photo a product to auto-identify it\n⚡ **Quick Add** — tap common items instantly\n📦 **Items** — manage your inventory\n🛒 **Shop** — shopping list\n📊 **Home** — stock overview\n\nWhat would you like to do?" }]);
+  const [msgs,      setMsgs]      = useState([{ role:"assistant", id:0, text:"Hi, I'm your inventory assistant. Tell me what you used or bought and I'll update your stock.\n\nTry: **remove 2 water**, **add 3 rolls of toilet paper**, or **what's running low?**" }]);
   const [chatInput, setChatInput] = useState("");
   const [chatBusy,  setChatBusy]  = useState(false);
   const chatEnd = useRef(null);
@@ -441,6 +202,7 @@ export default function App() {
   const [scanData, setScanData] = useState(null);
   const [scanSource, setScanSource] = useState(""); // "ai" | "local" | "none"
   const fileRef = useRef(null);
+  const galleryRef = useRef(null);
   const [showQuick, setShowQuick] = useState(false);
 
   // Items tab
@@ -462,38 +224,76 @@ export default function App() {
 
   const importRef = useRef(null);
 
-  // Persist
-  const userIdRef = useRef(getUserId());
-  useEffect(() => {
-    db.load(userIdRef.current).then(d => {
-      if (d) { setItems(d.items||[]); setShopList(d.shop||[]); }
-      setLoaded(true);
-    });
+  // Persist: local cache + versioned cloud sync (see sync.js)
+  const syncRef     = useRef(null);
+  const skipSave    = useRef(true);     // don't echo data that just arrived from the server back to it
+  const itemsRef    = useRef(items);    itemsRef.current = items;
+  const shopRef     = useRef(shopList); shopRef.current = shopList;
+  const tombRef     = useRef(tomb);     tombRef.current = tomb;
+
+  const applyRemote = useCallback((d) => {
+    skipSave.current = true;
+    setItems(d.items||[]); setShopList(d.shop||[]); setTomb(d.tomb||[]); setShopU(d.shopU||0);
   }, []);
-  useEffect(() => { if(loaded) db.save(userIdRef.current, { items, shop:shopList }); }, [items, shopList, loaded]);
+
+  useEffect(() => {
+    const sync = createSync({ onRemote: applyRemote, onStatus: (s, d) => { setSyncStatus(s); setSyncDetail(d || ""); } });
+    syncRef.current = sync;
+    const onLocked = () => setLocked(true);
+    window.addEventListener(LOCKED_EVENT, onLocked);
+    sync.init().finally(() => setLoaded(true));
+    return () => { window.removeEventListener(LOCKED_EVENT, onLocked); sync.destroy(); };
+  }, [applyRemote]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    if (skipSave.current) { skipSave.current = false; return; }
+    syncRef.current?.save({ items, shop:shopList, tomb, shopU });
+  }, [items, shopList, tomb, shopU, loaded]);
+
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior:"smooth" }); }, [msgs]);
+
+  const unlock = (code) => { setAccessCode(code); setLocked(false); syncRef.current?.init(); };
 
   const alertLow = useCallback((arr) => {
     arr.forEach(i => {
-      if (i.qty === 0)                   toast(`🚨 ${i.name} OUT OF STOCK!`, "danger");
-      else if (i.qty <= (i.minQty||1))   toast(`⚠️ Only ${i.qty} ${i.name} left!`, "warn");
+      if (i.qty === 0)                   toast(`${i.name} is out of stock`, "danger");
+      else if (i.qty <= (i.minQty||1))   toast(`Only ${i.qty} ${i.name} left`, "warn");
     });
   }, [toast]);
 
+  // All item mutations go through here so every change is time-stamped (`u`) for merging.
+  const stamp = x => ({ ...x, u: Date.now() });
+
+  const updateItem = useCallback((id, patch) => {
+    const prev = itemsRef.current;
+    const next = prev.map(x => x.id === id ? stamp({ ...x, ...(typeof patch === "function" ? patch(x) : patch) }) : x);
+    itemsRef.current = next; setItems(next);
+    return next.find(x => x.id === id);
+  }, []);
+
+  const removeItem = useCallback((id) => {
+    setItems(itemsRef.current = itemsRef.current.filter(x => x.id !== id));
+    setTomb(tombRef.current = [...tombRef.current.filter(t => t.id !== id), { id, u: Date.now() }]);
+  }, []);
+
+  const updateShop = useCallback((list) => { setShopList(list); setShopU(Date.now()); }, []);
+
   const addItem = useCallback((p) => {
-    setItems(prev => {
-      const idx = prev.findIndex(x => x.name.toLowerCase() === p.name.toLowerCase());
-      let next;
-      if (idx >= 0) {
-        next = prev.map((x,i) => i===idx ? { ...x, qty: x.qty+(p.qty||1) } : x);
-        toast(`✅ +${p.qty||1} ${p.name} (total ${prev[idx].qty+(p.qty||1)})`, "ok");
-      } else {
-        next = [...prev, { ...p, id:Date.now(), added:new Date().toLocaleDateString() }];
-        toast(`🆕 ${p.name} added!`, "ok");
-      }
-      alertLow(next.filter(x => x.name === p.name));
-      return next;
-    });
+    const prev = itemsRef.current;
+    const idx = prev.findIndex(x => x.name.toLowerCase() === p.name.toLowerCase());
+    let next, touched;
+    if (idx >= 0) {
+      touched = stamp({ ...prev[idx], qty: prev[idx].qty + (p.qty||1) });
+      next = prev.map((x,i) => i===idx ? touched : x);
+      toast(`Added ${p.qty||1} ${p.name} (now ${touched.qty})`, "ok");
+    } else {
+      touched = stamp({ ...p, id: nid(), added: new Date().toLocaleDateString() });
+      next = [...prev, touched];
+      toast(`${p.name} added`, "ok");
+    }
+    itemsRef.current = next; setItems(next);
+    alertLow([touched]);
   }, [toast, alertLow]);
 
   // Scan
@@ -535,19 +335,50 @@ export default function App() {
     const q = text.toLowerCase();
     const low = items.filter(i => i.qty <= (i.minQty||1));
     if (q.match(/low|running out|restock/))
-      return low.length ? `⚠️ **Low stock:**\n${low.map(i=>`• ${i.emoji} ${i.name}: ${i.qty===0?"OUT 🚨":`${i.qty} left`}`).join("\n")}` : "✅ Everything is well stocked!";
+      return low.length ? `**Running low:**\n${low.map(i=>`• ${i.name}: ${i.qty===0?"out of stock":`${i.qty} left`}`).join("\n")}` : "Everything is well stocked.";
     if (q.match(/inventory|show|list|what.*have|all items|what do/))
-      return items.length ? `📦 **Inventory (${items.length}):**\n${items.map(i=>`• ${i.emoji} ${i.name}: ${i.qty} ${i.unit}`).join("\n")}` : "📦 Inventory is empty. Add products in Scan tab!";
+      return items.length ? `**Inventory (${items.length}):**\n${items.map(i=>`• ${i.name}: ${i.qty} ${i.unit}`).join("\n")}` : "Your inventory is empty. Add products from the Scan tab.";
     if (q.match(/shop|buy|shopping/))
-      return shopList.length ? `🛒 **Shopping list:**\n${shopList.map(i=>`• ${i.name} ×${i.qty}`).join("\n")}` : "🛒 Shopping list is empty.";
+      return shopList.length ? `**Shopping list:**\n${shopList.map(i=>`• ${i.name} ×${i.qty}`).join("\n")}` : "Your shopping list is empty.";
     if (q.match(/expir/)) {
-      const week = new Date(Date.now()+7*864e5).toISOString().slice(0,10);
-      const e = items.filter(i=>i.expiry&&i.expiry<=week);
-      return e.length ? `⏰ **Expiring soon:**\n${e.map(i=>`• ${i.emoji} ${i.name} — ${i.expiry}`).join("\n")}` : "✅ Nothing expiring soon!";
+      const wk = localISO(7);
+      const e = items.filter(i=>i.expiry&&i.expiry<=wk);
+      return e.length ? `**Expiring soon:**\n${e.map(i=>`• ${i.name}, ${i.expiry}`).join("\n")}` : "Nothing is expiring soon.";
     }
-    if (q.match(/hi|hello|hey/)) return items.filter(i=>i.qty<=(i.minQty||1)).length > 0 ? `👋 Hi! You have **${items.filter(i=>i.qty<=(i.minQty||1)).length} items** running low. What would you like to do?` : "👋 Hi! Your inventory looks good. How can I help?";
-    return items.length ? `📊 **${items.length} products** tracked.\n${items.filter(i=>i.qty<=(i.minQty||1)).length > 0 ? `⚠️ ${items.filter(i=>i.qty<=(i.minQty||1)).length} items need restocking.` : "✅ All stocked up!"}\n\nAsk me *"what's low?"* or *"show inventory"*` : "📦 Inventory empty! Go to **Scan** to add products.";
+    if (q.match(/\b(hi|hello|hey)\b/)) return low.length ? `Hi. **${low.length} items** are running low. What would you like to do?` : "Hi. Your inventory looks good. How can I help?";
+    return items.length ? `You're tracking **${items.length} products**. ${low.length ? `${low.length} need restocking.` : "All are well stocked."}\n\nAsk "what's low?" or "show inventory".` : "Your inventory is empty. Use Scan to add products.";
   }, [items, shopList]);
+
+  // Apply changes the chat assistant asked for. Returns one human-readable line per action.
+  const findItem = (name) => {
+    const q = name.trim().toLowerCase(), list = itemsRef.current;
+    const exact = list.find(i => i.name.toLowerCase() === q);
+    if (exact) return exact;
+    const near = list.filter(i => i.name.toLowerCase().includes(q) || q.includes(i.name.toLowerCase()));
+    return near.length === 1 ? near[0] : null;     // ambiguous → don't guess
+  };
+  const applyActions = (actions) => {
+    const lines = [];
+    for (const a of actions || []) {
+      if (a.type === "adjust_quantity") {
+        const it = findItem(a.name);
+        if (!it) { lines.push(`I couldn't find "${a.name}" in your inventory, so nothing changed.`); continue; }
+        const next = Math.max(0, it.qty + a.delta);
+        const saved = updateItem(it.id, { qty: next });
+        lines.push(`**${it.name}**: ${it.qty} → ${next}`);
+        if (saved) alertLow([saved]);
+      } else if (a.type === "add_item") {
+        addItem({ name:a.name, qty:a.quantity, category:a.category, unit:a.unit, emoji:C_ICO[a.category] || "📦", minQty:1, expiry:"", notes:"", brand:"" });
+        lines.push(`Added ${a.quantity} × **${a.name}**`);
+      } else if (a.type === "add_to_shopping_list") {
+        const list = shopRef.current, idx = list.findIndex(l => l.name.toLowerCase() === a.name.toLowerCase());
+        const nextList = idx >= 0 ? list.map((l, i) => i === idx ? { ...l, qty: l.qty + a.quantity } : l) : [...list, { name:a.name, qty:a.quantity }];
+        shopRef.current = nextList; updateShop(nextList);
+        lines.push(`**${a.name}** ×${a.quantity} added to your shopping list`);
+      }
+    }
+    return lines;
+  };
 
   const sendChat = async (txt) => {
     const text = (txt ?? chatInput).trim(); if (!text || chatBusy) return;
@@ -556,10 +387,17 @@ export default function App() {
     setMsgs(p => [...p, um]);
     setChatBusy(true);
     try {
-      const reply = await aiChat([...msgs, um], items);
-      setMsgs(p => [...p, { role:"assistant", text:reply, id:Date.now() }]);
+      const { reply, actions } = await aiChat([...msgs, um], items);
+      const done = applyActions(actions);
+      const out = [reply, done.join("\n")].filter(Boolean).join("\n\n");
+      setMsgs(p => [...p, { role:"assistant", text:out, id:Date.now() }]);
     } catch {
-      setMsgs(p => [...p, { role:"assistant", text:offlineReply(text), id:Date.now() }]);
+      // Never let a failed AI call look like a successful edit.
+      const wantsChange = /\b(remove|add|use[ds]?|bought|buy|took|finished|consumed|minus|deduct|restock|got)\b/i.test(text);
+      const msg = wantsChange
+        ? "I couldn't reach the assistant, so **nothing was changed**. Use the − and + buttons in Items, or try again in a moment."
+        : offlineReply(text);
+      setMsgs(p => [...p, { role:"assistant", text:msg, id:Date.now() }]);
     } finally { setChatBusy(false); }
   };
 
@@ -579,359 +417,338 @@ export default function App() {
 
   const activeCats = ["All", ...CATS.filter(c=>items.some(i=>i.category===c))];
   const lowCount   = items.filter(i=>i.qty<=(i.minQty||1)).length;
-  const week       = new Date(Date.now()+7*864e5).toISOString().slice(0,10);
-  const md = t => t.split("\n").map((l,i,a)=><span key={i} dangerouslySetInnerHTML={{ __html: l.replace(/\*\*(.*?)\*\*/g,"<strong>$1</strong>")+(i<a.length-1?"<br/>":"") }}/>);
+  const week       = localISO(7);
+  // Escape first (item names and AI text are untrusted), then allow only **bold**.
+  const md = t => String(t ?? "").split("\n").map((l,i,a)=><span key={i} dangerouslySetInnerHTML={{ __html: esc(l).replace(/\*\*(.*?)\*\*/g,"<strong>$1</strong>")+(i<a.length-1?"<br/>":"") }}/>);
 
-  const doExport = () => { const a=document.createElement("a"); a.href="data:application/json;charset=utf-8,"+encodeURIComponent(JSON.stringify({items,shop:shopList},null,2)); a.download=`consumables-${Date.now()}.json`; a.click(); toast("📤 Exported","ok"); };
-  const doImport = e => { const f=e.target.files?.[0]; if(!f) return; const r=new FileReader(); r.onload=ev=>{try{const d=JSON.parse(ev.target.result);if(d.items){setItems(d.items);setShopList(d.shop||[]);toast(`📥 Imported ${d.items.length} items`,"ok");}else toast("❌ Invalid","danger");}catch{toast("❌ Error","danger");}};r.readAsText(f);e.target.value=""; };
+  const doExport = async () => {
+    const text = JSON.stringify({ items, shop:shopList }, null, 2);
+    const name = `consumables-${localISO()}.json`;
+    try {   // phones: native share sheet (Save to Files, AirDrop, Drive…)
+      const file = new File([text], name, { type:"application/json" });
+      if (navigator.canShare?.({ files:[file] })) { await navigator.share({ files:[file], title:"Consumables backup" }); return toast("Backup exported","ok"); }
+    } catch (e) { if (e?.name === "AbortError") return; }
+    const url = URL.createObjectURL(new Blob([text], { type:"application/json" }));
+    const a = document.createElement("a"); a.href = url; a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast("Backup exported","ok");
+  };
+  const doImport = e => {
+    const f=e.target.files?.[0]; if(!f) return;
+    const r=new FileReader();
+    r.onload=ev=>{
+      try {
+        const d=JSON.parse(ev.target.result);
+        if (!Array.isArray(d.items)) return toast("That isn't a valid backup file","danger");
+        const now=Date.now();
+        // Merge by item id: newer edit wins, so importing an older backup can't clobber newer changes.
+        const have=new Map(itemsRef.current.map(x=>[x.id,x]));
+        const incoming=d.items.filter(x=>x&&typeof x.name==="string"&&x.name.trim()).map(x=>({ ...x, id:x.id??nid(), u:Math.max(x.u||0,now) }));
+        incoming.forEach(x=>have.set(x.id,x));
+        const next=[...have.values()];
+        itemsRef.current=next; setItems(next);
+        setTomb(tombRef.current=tombRef.current.filter(t=>!have.has(t.id)));
+        if (Array.isArray(d.shop) && d.shop.length) updateShop(d.shop);
+        toast(`Imported ${incoming.length} items`,"ok");
+      } catch { toast("Couldn't read that file","danger"); }
+    };
+    r.readAsText(f); e.target.value="";
+  };
+
 
   // ── Render ─────────────────────────────────────────────────────────────────
+  if (locked) return <LockScreen onUnlock={unlock}/>;
+
+  const state = items.reduce((m, i) => { m[stockState(i)]++; return m; }, { ok: 0, low: 0, out: 0 });
+  const mood = state.out ? "bad" : state.low ? "warn" : "ok";
+  const needs = items.filter(i => stockState(i) !== "ok").sort((a, b) => a.qty - b.qty);
+  const expiring = items.filter(i => i.expiry && i.expiry <= week).sort((a, b) => a.expiry.localeCompare(b.expiry));
+  const syncColor = { synced:"var(--ok)", saving:"var(--accent)", loading:"var(--accent)", offline:"var(--warn)", error:"var(--bad)", locked:"var(--bad)" }[syncStatus] || "var(--ink-3)";
+  const SUGGEST = ["What's running low?", "Remove 1 water", "Add 2 toilet paper", "Show shopping list"];
+  const TITLES = {
+    home:  ["Overview", items.length ? `${items.length} products tracked` : "Nothing tracked yet"],
+    chat:  ["Assistant", ""],
+    scan:  ["Add a product", "Photograph it or pick from a list"],
+    items: ["Inventory", `${items.length} products`],
+    shop:  ["Shopping list", shopList.length ? `${shopList.filter(i => !i.checked).length} to buy` : ""],
+  };
+  const expLabel = (d) => d < localISO() ? "Expired" : d === localISO() ? "Expires today" : `Expires ${d}`;
+
+  const Row = ({ i, children, onClick }) => (
+    <div className="item">
+      <button className="item-main" onClick={onClick} aria-label={`${i.name}, ${i.qty} ${i.unit}`}>
+        <div className="tile" aria-hidden="true">{i.emoji}</div>
+        <div style={{ minWidth: 0 }}>
+          <div className="item-name">{i.name}</div>
+          <div className="item-meta">{i.brand ? `${i.brand} · ` : ""}{i.category}</div>
+          <StatusLine i={i}/>
+        </div>
+      </button>
+      {children}
+    </div>
+  );
+  const StatusLine = ({ i }) => {
+    const s = stockState(i);
+    if (i.expiry && i.expiry <= week) return <div className="status soon"><Icon name="clock" size={15}/>{expLabel(i.expiry)}</div>;
+    if (s === "out") return <div className="status out"><Icon name="alert" size={15}/>Out of stock</div>;
+    if (s === "low") return <div className="status low"><Icon name="alert" size={15}/>Running low</div>;
+    return null;
+  };
+
+  const tabs = [
+    ["home","home","Home", 0], ["chat","chat","Chat", 0], ["scan","scan","Scan", 0],
+    ["items","box","Items", state.out + state.low ? 0 : 0], ["shop","cart","Shop", shopList.filter(i => !i.checked).length],
+  ];
+
   return (
-    <div style={st.root}>
-      <div style={st.grain}/>
+    <div className="app" data-mood={mood}>
       <Toast list={toasts}/>
 
-      {/* Delete confirm */}
+      {showSettings && (
+        <SettingsModal syncStatus={syncStatus} syncDetail={syncDetail} toast={toast} onClose={()=>setShowSettings(false)}
+          onExport={doExport} onImport={()=>importRef.current?.click()} onRestore={()=>window.location.reload()} />
+      )}
+      <input ref={importRef} type="file" accept=".json" style={{ display:"none" }} onChange={doImport}/>
+
       {delItem && (
-        <Modal onClose={()=>setDelItem(null)}>
-          <p style={{ fontSize:14, color:"#c8d8ee", marginBottom:18 }}>Remove <b>{delItem.name}</b>?</p>
-          <div style={{ display:"flex", gap:10 }}>
-            <button style={{ ...st.btnRed, flex:1 }} onClick={()=>{ setItems(p=>p.filter(x=>x.id!==delItem.id)); setDelItem(null); toast("🗑 Removed","info"); }}>Yes, remove</button>
-            <button style={{ ...st.btnGhost, flex:1 }} onClick={()=>setDelItem(null)}>Cancel</button>
+        <Sheet onClose={()=>setDelItem(null)} title={`Remove ${delItem.name}?`}>
+          <p className="muted" style={{ marginBottom: 18 }}>This takes it off your inventory on all your devices.</p>
+          <div className="row">
+            <button className="btn btn-danger" style={{ flex:1 }} onClick={()=>{ removeItem(delItem.id); setDelItem(null); setEditItem(null); toast("Item removed","info"); }}>Remove</button>
+            <button className="btn btn-glass" style={{ flex:1 }} onClick={()=>setDelItem(null)}>Keep it</button>
           </div>
-        </Modal>
+        </Sheet>
       )}
 
-      {/* Edit modal */}
-      {editItem && (
-        <Modal onClose={()=>setEditItem(null)}>
-          <EditForm item={editItem} onSave={updated=>{ setItems(p=>p.map(x=>x.id===updated.id?updated:x)); setEditItem(null); toast("✏️ Updated","info"); alertLow([updated]); }} onCancel={()=>setEditItem(null)} />
-        </Modal>
+      {editItem && !delItem && (
+        <Sheet onClose={()=>setEditItem(null)} title="Edit item">
+          <EditForm item={editItem}
+            onSave={u=>{ const saved=updateItem(u.id, u); setEditItem(null); toast("Changes saved","ok"); if(saved) alertLow([saved]); }}
+            onCancel={()=>setEditItem(null)} onDelete={()=>setDelItem(editItem)} />
+        </Sheet>
       )}
 
-      {/* Quick add modal */}
       {showQuick && (
-        <Modal onClose={()=>setShowQuick(false)}>
-          <div style={{ fontSize:15, fontWeight:700, textAlign:"center", marginBottom:4 }}>⚡ Quick Add</div>
-          <p style={{ fontSize:12, color:"#5a7898", marginBottom:12, textAlign:"center" }}>Tap to add 1 unit instantly:</p>
-          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, maxHeight:"60vh", overflowY:"auto" }}>
+        <Sheet onClose={()=>setShowQuick(false)} title="Quick add">
+          <p className="muted" style={{ marginBottom: 14 }}>Tap a product to add one.</p>
+          <div className="quick" style={{ maxHeight: "52vh", overflowY: "auto" }}>
             {QUICK_LIST.map(p => (
-              <button key={p.name} style={st.qbtn} onClick={()=>{ addItem({...p,qty:1,minQty:1,expiry:"",notes:"",brand:""}); setShowQuick(false); }}>
-                <div style={{ fontSize:22 }}>{p.emoji}</div>
-                <div style={{ fontSize:11, fontWeight:600, marginTop:3, lineHeight:1.3 }}>{p.name}</div>
+              <button key={p.name} className="glass" onClick={()=>{ addItem({...p,qty:1,minQty:1,expiry:"",notes:"",brand:""}); setShowQuick(false); }}>
+                <span aria-hidden="true">{p.emoji}</span>{p.name}
               </button>
             ))}
           </div>
-          <button style={{ ...st.btnGhost, width:"100%", marginTop:12 }} onClick={()=>setShowQuick(false)}>Close</button>
-        </Modal>
+        </Sheet>
       )}
 
-      {/* Header */}
-      <header style={st.hdr}>
-        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-          <div style={st.logo}>🛒</div>
-          <div>
-            <div style={st.appName}>Consumables</div>
-            <div style={st.appSub}>AI Inventory Agent</div>
-          </div>
+      {showSort && (
+        <Sheet onClose={()=>setShowSort(false)} title="Sort by">
+          {["Name A-Z","Name Z-A","Qty: Low→High","Qty: High→Low","Recently Added","Category"].map(o => (
+            <button key={o} className="opt" role="radio" aria-checked={sortBy===o} onClick={()=>{ setSortBy(o); setShowSort(false); }}>
+              {o.replace("→"," to ")}{sortBy===o && <Icon name="check" size={20}/>}
+            </button>
+          ))}
+        </Sheet>
+      )}
+
+      <header className={`top ${tab==="chat" ? "compact" : ""}`}>
+        <div>
+          <h1>{TITLES[tab][0]}</h1>
+          {TITLES[tab][1] && <p>{TITLES[tab][1]}</p>}
         </div>
-        <div style={{ display:"flex", gap:5, alignItems:"center" }}>
-          <div style={st.pill}><b style={st.pN}>{items.length}</b><span style={st.pL}>items</span></div>
-          {lowCount>0 && <div style={{ ...st.pill, background:"rgba(245,158,11,.1)", border:"1px solid rgba(245,158,11,.25)" }}><b style={st.pN}>{lowCount}</b><span style={st.pL}>low⚠️</span></div>}
-          <button style={st.hbtn} onClick={doExport}>📤</button>
-          <button style={st.hbtn} onClick={()=>importRef.current?.click()}>📥</button>
-          <input ref={importRef} type="file" accept=".json" style={{ display:"none" }} onChange={doImport}/>
-        </div>
+        <button className="icon-btn glass" aria-label="Settings and sync" onClick={()=>setShowSettings(true)}>
+          <Icon name="sliders" size={22}/>
+          <span className="sync-dot" style={{ background: syncColor }}/>
+        </button>
       </header>
 
-      {/* Tabs */}
-      <nav style={st.nav}>
-        {[{id:"home",icon:"📊",label:"Home"},{id:"chat",icon:"💬",label:"Chat"},{id:"scan",icon:"📷",label:"Scan"},{id:"items",icon:"📦",label:"Items"},{id:"shop",icon:"🛒",label:"Shop"}].map(t=>(
-          <button key={t.id} style={{ ...st.tab, ...(tab===t.id?st.tabOn:{}) }} onClick={()=>setTab(t.id)}>
-            <span style={{ fontSize:16 }}>{t.icon}</span>
-            <span style={st.tabLbl}>{t.label}</span>
-            {t.id==="items" && lowCount>0 && <span style={{ ...st.dot, background:"#f59e0b" }}>{lowCount}</span>}
-            {t.id==="shop"  && shopList.length>0 && <span style={st.dot}>{shopList.length}</span>}
-          </button>
-        ))}
-      </nav>
-
-      <main style={st.main}>
+      <main className={`main ${tab==="chat" ? "flush" : ""}`}>
 
         {/* ── HOME ── */}
-        {tab==="home" && (() => {
-          const total=items.length, low=items.filter(i=>i.qty<=(i.minQty||1)), out=items.filter(i=>i.qty===0), exp=items.filter(i=>i.expiry&&i.expiry<=week), byCat=CATS.map(c=>({c,n:items.filter(i=>i.category===c).length})).filter(x=>x.n>0);
-          if (!total) return (
-            <div style={{ display:"flex", flexDirection:"column", alignItems:"center", padding:"48px 20px", textAlign:"center" }}>
-              <div style={{ fontSize:60 }}>🛒</div>
-              <h2 style={{ fontSize:18, fontWeight:700, marginTop:14 }}>Welcome!</h2>
-              <p style={{ fontSize:13, color:"#5a7898", marginTop:10, lineHeight:1.7, maxWidth:270 }}>Track your household consumables and get alerts when you're running low.</p>
-              <button style={{ ...st.bigBtn, marginTop:24 }} onClick={()=>setTab("scan")}>📷 Scan Your First Product</button>
-              <button style={{ ...st.outBtn, marginTop:10 }} onClick={()=>setShowQuick(true)}>⚡ Quick Add Common Items</button>
-            </div>
-          );
-          return (
-            <div style={{ padding:14 }}>
-              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:14 }}>
-                {[{n:total,l:"Products"},{n:items.reduce((s,i)=>s+i.qty,0),l:"Total Units"},{n:low.length,l:"Low Stock ⚠️",w:low.length>0},{n:out.length,l:"Out of Stock",d:out.length>0}].map(({n,l,w,d})=>(
-                  <div key={l} style={{ ...st.scard, ...(d&&n>0?{border:"1px solid rgba(239,68,68,.3)",background:"rgba(239,68,68,.05)"}:w&&n>0?{border:"1px solid rgba(245,158,11,.3)",background:"rgba(245,158,11,.05)"}:{}) }}>
-                    <div style={{ fontSize:26, fontWeight:700, lineHeight:1 }}>{n}</div>
-                    <div style={{ fontSize:11, color:"#5a7898", marginTop:4 }}>{l}</div>
-                  </div>
-                ))}
+        {tab==="home" && (<>
+          <section className="glass health" aria-label="Stock health">
+            {items.length === 0 ? (<>
+              <h2>Start your inventory</h2>
+              <p>Scan a product, or ask the assistant to add one.</p>
+              <button className="btn btn-primary block" style={{ marginTop: 16 }} onClick={()=>setTab("scan")}><Icon name="scan" size={20}/>Add first product</button>
+            </>) : (<>
+              <h2>{state.out ? `${state.out} out of stock` : state.low ? `${state.low} running low` : "Everything is stocked"}</h2>
+              <p>{state.out || state.low ? "These need restocking soon." : `All ${items.length} products are above their warning level.`}</p>
+              <div className="meter" role="img" aria-label={`${state.ok} stocked, ${state.low} low, ${state.out} out`}>
+                {state.ok > 0 && <span style={{ flex: state.ok, background: "var(--ok)" }}/>}
+                {state.low > 0 && <span style={{ flex: state.low, background: "var(--warn)" }}/>}
+                {state.out > 0 && <span style={{ flex: state.out, background: "var(--bad)" }}/>}
               </div>
-              {exp.length>0 && <div style={st.alertR}>⏰ <b>Expiring soon:</b> {exp.map(i=>i.name).join(", ")}</div>}
-              {low.length>0 && (
-                <div style={st.card}>
-                  <div style={st.cardHd}>🔴 Needs Restocking</div>
-                  {low.map(i=><div key={i.id} style={st.row}><span>{i.emoji} {i.name}</span><span style={{ color:i.qty===0?"#f87171":"#fbbf24", fontWeight:700 }}>{i.qty===0?"OUT":`${i.qty} left`}</span></div>)}
-                  <button style={st.lbtn} onClick={()=>setTab("shop")}>🛒 Open Shopping List →</button>
-                </div>
-              )}
-              {byCat.length>0 && (
-                <div style={st.card}>
-                  <div style={st.cardHd}>📊 By Category</div>
-                  {byCat.map(({c,n})=>(
-                    <div key={c} style={{ display:"flex", alignItems:"center", gap:8, padding:"4px 0" }}>
-                      <span style={{ fontSize:11, width:130, flexShrink:0 }}>{C_ICO[c]} {c}</span>
-                      <div style={{ flex:1, height:5, background:"rgba(255,255,255,0.06)", borderRadius:3, overflow:"hidden" }}>
-                        <div style={{ height:"100%", borderRadius:3, width:`${Math.max(8,(n/total)*100)}%`, background:C_CLR[c] }}/>
-                      </div>
-                      <span style={{ fontSize:12, fontWeight:600, width:18, textAlign:"right" }}>{n}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
+              <div className="legend">
+                <span><i style={{ background:"var(--ok)" }}/><b>{state.ok}</b>stocked</span>
+                <span><i style={{ background:"var(--warn)" }}/><b>{state.low}</b>low</span>
+                <span><i style={{ background:"var(--bad)" }}/><b>{state.out}</b>out</span>
+              </div>
+            </>)}
+          </section>
+
+          {needs.length > 0 && (<>
+            <h2 className="h2">Restock soon</h2>
+            <div className="glass group">
+              {needs.slice(0, 6).map(i => {
+                const listed = shopList.some(l => l.name.toLowerCase() === i.name.toLowerCase());
+                return (
+                  <Row key={i.id} i={i} onClick={()=>setEditItem(i)}>
+                    <button className="btn btn-glass btn-sm" disabled={listed} aria-label={listed ? `${i.name} is on your list` : `Add ${i.name} to shopping list`}
+                      onClick={()=>{ updateShop([...shopList, { name:i.name, qty:Math.max(1, i.minQty||2) }]); toast(`${i.name} added to your list`,"ok"); }}>
+                      <Icon name={listed ? "check" : "cartplus"} size={19}/>{listed ? "Listed" : "Buy"}
+                    </button>
+                  </Row>
+                );
+              })}
             </div>
-          );
-        })()}
+            {needs.length > 6 && <button className="btn btn-text" style={{ marginTop: 4 }} onClick={()=>{ setSortBy("Qty: Low→High"); setTab("items"); }}>See all {needs.length}</button>}
+          </>)}
+
+          {expiring.length > 0 && (<>
+            <h2 className="h2">Expiring within a week</h2>
+            <div className="glass group">
+              {expiring.slice(0, 5).map(i => <Row key={i.id} i={i} onClick={()=>setEditItem(i)}/>)}
+            </div>
+          </>)}
+
+          {items.length > 0 && (<>
+            <h2 className="h2">By category</h2>
+            <div className="glass group">
+              {CATS.filter(c => items.some(i => i.category === c)).map(c => {
+                const xs = items.filter(i => i.category === c);
+                const n = xs.length, okN = xs.filter(i => stockState(i) === "ok").length;
+                return (
+                  <button key={c} className="item" style={{ width:"100%", textAlign:"left" }} onClick={()=>{ setCatF(c); setTab("items"); }}>
+                    <div className="tile" aria-hidden="true">{C_ICO[c]}</div>
+                    <div style={{ flex:1, minWidth:0 }}>
+                      <div className="item-name">{c}</div>
+                      <div className="item-meta">{n} {n===1?"product":"products"}{okN < n ? `, ${n-okN} need attention` : ""}</div>
+                      <div className="bar"><div style={{ width:`${Math.round(okN/n*100)}%`, background:C_CLR[c] }}/></div>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </>)}
+        </>)}
+
+        {/* ── ITEMS ── */}
+        {tab==="items" && (<>
+          <div className="row" style={{ marginBottom: 12 }}>
+            <label className="search">
+              <Icon name="search" size={20}/>
+              <input className="input" aria-label="Search products" placeholder="Search products" value={search} onChange={e=>setSearch(e.target.value)} />
+            </label>
+            <button className="icon-btn glass" aria-label="Sort" onClick={()=>setShowSort(true)}><Icon name="sort" size={22}/></button>
+            <button className="icon-btn glass" aria-label="Add a product" onClick={()=>setTab("scan")}><Icon name="plus" size={24}/></button>
+          </div>
+          <div className="chips" role="group" aria-label="Filter by category">
+            {activeCats.map(c => (
+              <button key={c} className="chip glass" aria-pressed={catF===c} onClick={()=>setCatF(c)}>
+                {c!=="All" && <i style={{ background:C_CLR[c] }}/>}{c}
+              </button>
+            ))}
+          </div>
+          {displayed.length === 0 ? (
+            <div className="empty">
+              <Icon name="box" size={42}/>
+              <h3>{items.length ? "No matches" : "No products yet"}</h3>
+              <p>{items.length ? "Try a different search or category." : "Scan a product or use Quick add to get started."}</p>
+            </div>
+          ) : (
+            <div className="glass group" style={{ marginTop: 12 }}>
+              {displayed.map(i => (
+                <Row key={i.id} i={i} onClick={()=>setEditItem(i)}>
+                  <Stepper value={i.qty} unit={i.unit} label={`${i.name} quantity`}
+                    onChange={q=>{ const saved=updateItem(i.id,{qty:q}); if(saved && q<i.qty) alertLow([saved]); }} />
+                </Row>
+              ))}
+            </div>
+          )}
+        </>)}
+
+        {/* ── SCAN ── */}
+        {tab==="scan" && (<>
+          <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{ display:"none" }} onChange={handleFile}/>
+          <input ref={galleryRef} type="file" accept="image/*" style={{ display:"none" }} onChange={handleFile}/>
+
+          {scanStep==="idle" && (<>
+            <section className="glass hero">
+              <div className="ring"><Icon name="scan" size={38}/></div>
+              <h2>Scan a product</h2>
+              <p>Take a photo and the assistant fills in the name, category and unit for you.</p>
+              <button className="btn btn-primary block" onClick={()=>fileRef.current?.click()}><Icon name="scan" size={22}/>Take photo</button>
+              <div className="row" style={{ width:"100%" }}>
+                <button className="btn btn-glass" style={{ flex:1 }} onClick={()=>galleryRef.current?.click()}><Icon name="image" size={20}/>Gallery</button>
+                <button className="btn btn-glass" style={{ flex:1 }} onClick={()=>setShowQuick(true)}><Icon name="bolt" size={20}/>Quick add</button>
+              </div>
+              <button className="btn btn-text" onClick={()=>{ setScanData(null); setScanSource("none"); setScanStep("manual"); }}>Enter details by hand</button>
+            </section>
+          </>)}
+
+          {scanStep==="scanning" && (
+            <section className="glass hero" aria-live="polite">
+              {scanImg && <img className="preview" src={scanImg} alt="Your photo"/>}
+              <div className="spinner"/>
+              <h2>Reading your photo</h2>
+              <p>This usually takes a few seconds.</p>
+              <button className="btn btn-text" onClick={resetScan}>Cancel</button>
+            </section>
+          )}
+
+          {scanStep==="confirm" && scanData && (
+            <ItemForm title="Confirm product" image={scanImg} prefill={scanData} isAI={scanSource==="ai"} onSave={finishScan} onCancel={resetScan}/>
+          )}
+
+          {scanStep==="manual" && (<>
+            {scanSource==="none" && scanImg && <div className="notice hint">We couldn't identify this photo. Enter the details below.</div>}
+            <ItemForm title="Add product" image={scanImg} prefill={scanData} onSave={finishScan} onCancel={resetScan}/>
+          </>)}
+
+          {scanStep==="done" && (
+            <section className="glass hero" aria-live="polite">
+              <div className="ring" style={{ color:"var(--ok)", borderColor:"rgba(91,227,168,.4)", background:"rgba(91,227,168,.12)" }}><Icon name="check" size={40} stroke={2.4}/></div>
+              <h2>Added to inventory</h2>
+            </section>
+          )}
+        </>)}
+
+        {/* ── SHOP ── */}
+        {tab==="shop" && <ShopTab items={items} shopList={shopList} setShopList={updateShop}/>}
 
         {/* ── CHAT ── */}
         {tab==="chat" && (
-          <div style={st.chatWrap}>
-            <div style={st.chatScroll}>
-              {msgs.length<=1 && (
-                <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:14 }}>
-                  {["What's running low?","Show my inventory","What should I restock?","Expiring soon?","Stock summary"].map(q=>(
-                    <button key={q} style={st.qchip} onClick={()=>sendChat(q)}>{q}</button>
-                  ))}
-                </div>
-              )}
-              {msgs.map(m=>(
-                <div key={m.id} style={{ ...st.bubble, ...(m.role==="user"?st.bubU:st.bubA) }}>
-                  {m.role==="assistant" && <div style={st.avatar}>🤖</div>}
-                  <div style={{ ...st.bubText, ...(m.role==="user"?st.bubTextU:{}) }}>{md(m.text)}</div>
-                </div>
+          <div className="chat">
+            <div className="chat-scroll" aria-live="polite">
+              {msgs.map(m => (
+                <div key={m.id} className={`bubble ${m.role==="user" ? "u" : "a glass"}`}>{md(m.text)}</div>
               ))}
-              {chatBusy && <div style={{ ...st.bubble, ...st.bubA }}><div style={st.avatar}>🤖</div><div style={st.bubText}><span className="dots"><span/><span/><span/></span></div></div>}
+              {chatBusy && <div className="bubble a glass" aria-label="Assistant is typing"><span className="typing"><span/><span/><span/></span></div>}
               <div ref={chatEnd}/>
             </div>
-            <div style={st.chatBar}>
-              <input style={st.chatIn} value={chatInput} onChange={e=>setChatInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&sendChat()} placeholder="Ask about your inventory…" disabled={chatBusy}/>
-              <button style={{ ...st.sendBtn, opacity:chatBusy||!chatInput.trim()?0.4:1 }} onClick={()=>sendChat()} disabled={chatBusy||!chatInput.trim()}>➤</button>
+            <div className="composer-wrap">
+              <div className="chips" role="group" aria-label="Suggested messages">
+                {SUGGEST.map(q => <button key={q} className="chip glass" disabled={chatBusy} onClick={()=>sendChat(q)}>{q}</button>)}
+              </div>
+              <form className="composer glass-strong" onSubmit={e=>{ e.preventDefault(); sendChat(); }}>
+                <input aria-label="Message the assistant" placeholder="Message the assistant" value={chatInput}
+                  onChange={e=>setChatInput(e.target.value)} enterKeyHint="send" autoComplete="off"/>
+                <button className="send" type="submit" aria-label="Send" disabled={!chatInput.trim() || chatBusy}><Icon name="send" size={24} stroke={2.4}/></button>
+              </form>
             </div>
           </div>
         )}
-
-        {/* ── SCAN ── */}
-        {tab==="scan" && (
-          <div style={st.scanWrap}>
-            {scanStep==="idle" && (<>
-              <div style={st.scanRing}>📷</div>
-              <h2 style={{ fontSize:19, fontWeight:700 }}>Scan a Product</h2>
-              <p style={{ fontSize:12, color:"#5a7898", textAlign:"center", maxWidth:270, lineHeight:1.7 }}>
-                Point your camera at a <b style={{ color:"#93c5fd" }}>product label or packaging</b>. AI will automatically read and categorize it.
-              </p>
-              <button style={st.bigBtn} onClick={()=>fileRef.current?.click()}>
-                📷 Open Camera / Upload Photo
-              </button>
-              <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{ display:"none" }} onChange={handleFile}/>
-              <div style={{ display:"flex", gap:6, flexWrap:"wrap", justifyContent:"center" }}>
-                {["✅ Product labels","✅ Barcodes","✅ Packaging","✅ Bottles"].map(h=>(
-                  <span key={h} style={{ background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.07)", borderRadius:7, padding:"4px 9px", fontSize:10, color:"#5a7898" }}>{h}</span>
-                ))}
-              </div>
-              <div style={{ color:"#2a3a55", fontSize:11 }}>— or —</div>
-              <button style={st.outBtn} onClick={()=>setScanStep("manual")}>✏️ Enter Manually</button>
-              <button style={{ ...st.outBtn, color:"#fbbf24", borderColor:"rgba(245,158,11,0.3)" }} onClick={()=>setShowQuick(true)}>⚡ Quick Add Common Items</button>
-            </>)}
-
-            {scanStep==="scanning" && (
-              <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:14, padding:"24px 0", width:"100%" }}>
-                {scanImg && <img src={scanImg} alt="" style={{ width:"100%", maxHeight:220, objectFit:"contain", borderRadius:12, background:"rgba(0,0,0,.2)", border:"1px solid rgba(255,255,255,.08)" }}/>}
-                <div style={st.spinner}/>
-                <p style={{ fontSize:13, color:"#93c5fd", fontWeight:600 }}>🤖 Analyzing product…</p>
-                <p style={{ fontSize:11, color:"#5a7898" }}>Reading label and identifying category</p>
-              </div>
-            )}
-
-            {scanStep==="confirm" && scanData && (
-              <>
-                {scanSource==="ai" && (
-                  <div style={{ width:"100%", background:"rgba(16,185,129,.08)", border:"1px solid rgba(16,185,129,.2)", borderRadius:10, padding:"8px 14px", fontSize:12, color:"#6ee7b7", textAlign:"center", marginBottom:8 }}>
-                    ✅ AI successfully identified this product
-                  </div>
-                )}
-                {scanSource==="local" && (
-                  <div style={{ width:"100%", background:"rgba(59,130,246,.08)", border:"1px solid rgba(59,130,246,.2)", borderRadius:10, padding:"8px 14px", fontSize:12, color:"#93c5fd", textAlign:"center", marginBottom:8 }}>
-                    🔍 Detected from product name — please verify
-                  </div>
-                )}
-                <ItemForm image={scanImg} prefill={scanData} isAI={scanSource==="ai"} title="✅ Confirm Product" onSave={finishScan} onCancel={resetScan}/>
-              </>
-            )}
-            {scanStep==="manual" && (
-              <ItemForm image={scanImg} prefill={scanData} isAI={false} title="✏️ Add Product" onSave={finishScan} onCancel={resetScan}/>
-            )}
-            {scanStep==="done" && (
-              <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:12, padding:"40px 0" }}>
-                <div style={{ fontSize:64 }}>✅</div>
-                <p style={{ fontSize:17, fontWeight:700, color:"#10b981" }}>Added to Inventory!</p>
-                <button style={st.outBtn} onClick={resetScan}>Scan Another</button>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* ── ITEMS ── */}
-        {tab==="items" && (
-          <div style={{ padding:12 }}>
-            <div style={{ display:"flex", gap:7, marginBottom:10 }}>
-              <input style={{ ...st.inp, flex:1 }} placeholder="🔍 Search…" value={search} onChange={e=>setSearch(e.target.value)}/>
-              <div style={{ position:"relative" }}>
-                <button style={st.hbtn} onClick={()=>setShowSort(v=>!v)}>⇅</button>
-                {showSort && (
-                  <div style={st.sortDrop}>
-                    {["Name A-Z","Name Z-A","Qty: Low→High","Qty: High→Low","Recently Added","Category"].map(o=>(
-                      <button key={o} style={{ ...st.sortOpt, ...(sortBy===o?{background:"rgba(37,99,235,.15)",color:"#60a5fa"}:{}) }} onClick={()=>{setSortBy(o);setShowSort(false);}}>{o}</button>
-                    ))}
-                  </div>
-                )}
-              </div>
-              <button style={{ ...st.hbtn, background:"rgba(16,185,129,0.1)", borderColor:"rgba(16,185,129,0.2)" }} onClick={()=>{ setScanStep("manual"); setTab("scan"); }}>＋</button>
-            </div>
-            <div style={{ display:"flex", gap:5, overflowX:"auto", paddingBottom:8, marginBottom:8 }}>
-              {activeCats.map(c=>(
-                <button key={c} style={{ ...st.fchip, ...(catF===c?{background:"rgba(37,99,235,.18)",border:"1px solid rgba(96,165,250,.3)",color:"#60a5fa"}:{}) }} onClick={()=>setCatF(c)}>
-                  {c==="All" ? c : `${C_ICO[c]} ${c}`}
-                </button>
-              ))}
-            </div>
-            <div style={{ fontSize:10, color:"#374a60", marginBottom:8 }}>{displayed.length} of {items.length} · {sortBy}</div>
-            {displayed.length===0 ? (
-              <div style={{ textAlign:"center", padding:"48px 20px", color:"#5a7898" }}>
-                <div style={{ fontSize:44 }}>{search?"🔍":"📦"}</div>
-                <p style={{ marginTop:10, fontSize:13 }}>{search?`No results for "${search}"`:"No items yet"}</p>
-              </div>
-            ) : (
-              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-                {displayed.map(item => {
-                  const isLow=item.qty<=(item.minQty||1), isOut=item.qty===0, isExp=item.expiry&&item.expiry<=week;
-                  return (
-                    <div key={item.id} style={{ ...st.icard, ...(isOut?{border:"1px solid rgba(239,68,68,.3)",background:"rgba(239,68,68,.04)"}:isLow?{border:"1px solid rgba(245,158,11,.3)",background:"rgba(245,158,11,.04)"}:{}), ...(isExp?{borderTop:"2px solid #ef444466"}:{}) }}>
-                      <div style={{ display:"flex", justifyContent:"space-between", marginBottom:6 }}>
-                        <span style={{ fontSize:26 }}>{item.emoji||"📦"}</span>
-                        <div style={{ display:"flex", gap:3 }}>
-                          <button style={st.mb} onClick={()=>setEditItem(item)}>✏️</button>
-                          <button style={st.mb} onClick={()=>setDelItem(item)}>🗑</button>
-                        </div>
-                      </div>
-                      <div style={{ fontSize:13, fontWeight:600, lineHeight:1.3, marginBottom:2 }}>{item.name}</div>
-                      {item.brand && <div style={{ fontSize:10, color:"#3a5070", marginBottom:4 }}>{item.brand}</div>}
-                      <div style={{ display:"inline-block", borderRadius:5, padding:"1px 6px", fontSize:9, fontWeight:500, marginBottom:4, background:C_CLR[item.category]+"22", color:C_CLR[item.category] }}>{item.category}</div>
-                      {isOut && <div style={{ fontSize:9, fontWeight:700, color:"#f87171", background:"rgba(239,68,68,.12)", borderRadius:5, padding:"2px 6px", display:"inline-block", marginBottom:4 }}>🚨 OUT</div>}
-                      {!isOut&&isLow && <div style={{ fontSize:9, fontWeight:700, color:"#fbbf24", background:"rgba(245,158,11,.12)", borderRadius:5, padding:"2px 6px", display:"inline-block", marginBottom:4 }}>⚠️ LOW</div>}
-                      {isExp && <div style={{ fontSize:9, color:"#fca5a5", marginBottom:4 }}>⏰ Exp {item.expiry}</div>}
-                      <Stepper value={item.qty} onChange={v=>{ setItems(p=>{ const n=p.map(x=>x.id===item.id?{...x,qty:v}:x); alertLow(n.filter(x=>x.id===item.id)); return n; }); }}/>
-                      <div style={{ textAlign:"center", fontSize:10, color:"#4a6585", marginTop:3 }}>{item.unit}</div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* ── SHOP ── */}
-        {tab==="shop" && <ShopTab items={items} shopList={shopList} setShopList={setShopList} />}
-
       </main>
 
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&display=swap');
-        *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-        body{font-family:'Sora',sans-serif;-webkit-tap-highlight-color:transparent}
-        input,select,button{font-family:inherit}
-        ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-thumb{background:#1a2e4a;border-radius:4px}
-        input[type=date]{color-scheme:dark}
-        input[type=number]{-moz-appearance:textfield}
-        input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none}
-        select option{background:#0a1628}
-        @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
-        @keyframes slideIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
-        @keyframes spin{to{transform:rotate(360deg)}}
-        @keyframes blink{0%,80%,100%{opacity:.1}40%{opacity:1}}
-        .dots span{display:inline-block;width:6px;height:6px;border-radius:50%;background:#60a5fa;margin:0 2px;animation:blink 1.2s infinite}
-        .dots span:nth-child(2){animation-delay:.2s}.dots span:nth-child(3){animation-delay:.4s}
-      `}</style>
+      <nav className="dock glass-strong" aria-label="Main">
+        {tabs.map(([id, ico, label, badge]) => (
+          <button key={id} aria-current={tab===id ? "page" : undefined} onClick={()=>setTab(id)}>
+            <Icon name={ico} size={24}/>{label}
+            {badge > 0 && <span className="badge">{badge}</span>}
+          </button>
+        ))}
+      </nav>
     </div>
   );
 }
-
-// ─── Styles ────────────────────────────────────────────────────────────────────
-const BG="#07101e", PANEL="#0c1828", BORD="rgba(255,255,255,0.07)", TXT="#e2eaf5", MUT="#5a7898";
-const st = {
-  root:{ fontFamily:"'Sora',sans-serif", background:`linear-gradient(155deg,${BG} 0%,#0d1a2e 55%,${BG} 100%)`, minHeight:"100vh", color:TXT, display:"flex", flexDirection:"column", maxWidth:500, margin:"0 auto", position:"relative", overflow:"hidden" },
-  grain:{ position:"fixed", inset:0, opacity:.015, backgroundImage:"url(\"data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E\")", pointerEvents:"none", zIndex:0 },
-  main:{ flex:1, overflowY:"auto", position:"relative", zIndex:1 },
-  hdr:{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"13px 13px 10px", borderBottom:`1px solid ${BORD}`, position:"relative", zIndex:1 },
-  logo:{ width:38, height:38, borderRadius:11, background:"linear-gradient(135deg,#1a3a62,#2563eb)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:20, flexShrink:0, boxShadow:"0 0 14px rgba(37,99,235,.3)" },
-  appName:{ fontSize:17, fontWeight:700, letterSpacing:"-.4px" },
-  appSub:{ fontSize:9, color:MUT, textTransform:"uppercase", letterSpacing:".8px" },
-  hbtn:{ width:32, height:32, background:"rgba(255,255,255,.05)", border:`1px solid ${BORD}`, borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center", fontSize:14, cursor:"pointer", flexShrink:0 },
-  pill:{ background:"rgba(255,255,255,.04)", border:`1px solid ${BORD}`, borderRadius:8, padding:"3px 9px", textAlign:"center" },
-  pN:{ display:"block", fontSize:14, fontWeight:700, lineHeight:1 },
-  pL:{ display:"block", fontSize:8, color:MUT, marginTop:1 },
-  nav:{ display:"flex", borderBottom:`1px solid ${BORD}`, zIndex:1 },
-  tab:{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:2, padding:"8px 2px", background:"transparent", border:"none", color:"#3a5575", cursor:"pointer", position:"relative" },
-  tabOn:{ color:"#60a5fa", borderBottom:"2px solid #60a5fa" },
-  tabLbl:{ fontSize:9, fontWeight:500 },
-  dot:{ position:"absolute", top:5, right:"calc(50% - 20px)", background:"#ef4444", color:"#fff", fontSize:8, fontWeight:700, borderRadius:999, padding:"1px 4px", minWidth:13, textAlign:"center" },
-  btnGreen:{ padding:"11px 16px", background:"linear-gradient(135deg,#059669,#10b981)", color:"#fff", border:"none", borderRadius:10, fontSize:13, fontWeight:600, cursor:"pointer" },
-  btnBlue:{ padding:"11px 16px", background:"linear-gradient(135deg,#1d4ed8,#3b82f6)", color:"#fff", border:"none", borderRadius:10, fontSize:13, fontWeight:600, cursor:"pointer" },
-  btnRed:{ padding:"11px 16px", background:"linear-gradient(135deg,#b91c1c,#ef4444)", color:"#fff", border:"none", borderRadius:10, fontSize:13, fontWeight:600, cursor:"pointer" },
-  btnGhost:{ padding:"11px 16px", background:"rgba(255,255,255,.05)", color:TXT, border:`1px solid ${BORD}`, borderRadius:10, fontSize:13, cursor:"pointer" },
-  bigBtn:{ background:"linear-gradient(135deg,#1d4ed8,#3b82f6)", color:"#fff", border:"none", borderRadius:13, padding:"13px 0", fontSize:14, fontWeight:600, cursor:"pointer", boxShadow:"0 5px 18px rgba(37,99,235,.4)", width:"100%", maxWidth:280 },
-  outBtn:{ background:"rgba(255,255,255,.04)", color:"#a0b8d0", border:`1px solid ${BORD}`, borderRadius:13, padding:"11px 0", fontSize:13, cursor:"pointer", width:"100%", maxWidth:280, textAlign:"center" },
-  lbtn:{ background:"none", border:"none", color:"#60a5fa", fontSize:12, cursor:"pointer", padding:0, marginTop:8 },
-  tinyBtn:{ background:"rgba(255,255,255,.04)", border:`1px solid ${BORD}`, borderRadius:7, padding:"4px 8px", fontSize:10, color:MUT, cursor:"pointer" },
-  chipBtn:{ background:"rgba(37,99,235,.12)", border:"1px solid rgba(96,165,250,.2)", borderRadius:7, padding:"3px 8px", fontSize:11, color:"#60a5fa", cursor:"pointer", flexShrink:0 },
-  mb:{ background:"none", border:"none", fontSize:13, cursor:"pointer", opacity:.55, padding:2 },
-  inp:{ width:"100%", background:"rgba(255,255,255,.05)", border:`1px solid rgba(255,255,255,.1)`, borderRadius:9, padding:"8px 11px", color:TXT, fontSize:13, outline:"none" },
-  sb:{ width:28, height:28, borderRadius:7, background:"rgba(255,255,255,.07)", border:`1px solid ${BORD}`, color:TXT, fontSize:17, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 },
-  chatWrap:{ display:"flex", flexDirection:"column", height:"calc(100vh - 140px)" },
-  chatScroll:{ flex:1, overflowY:"auto", padding:"12px 12px 6px" },
-  qchip:{ background:"rgba(37,99,235,.1)", border:"1px solid rgba(96,165,250,.2)", borderRadius:20, padding:"5px 11px", fontSize:11, color:"#93c5fd", cursor:"pointer" },
-  bubble:{ display:"flex", gap:7, marginBottom:10, animation:"fadeUp .3s ease" },
-  bubA:{ alignItems:"flex-start" },
-  bubU:{ flexDirection:"row-reverse" },
-  avatar:{ width:28, height:28, borderRadius:8, background:"linear-gradient(135deg,#1a3a62,#2563eb)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13, flexShrink:0 },
-  bubText:{ background:"rgba(255,255,255,.04)", border:`1px solid ${BORD}`, borderRadius:"4px 11px 11px 11px", padding:"8px 12px", fontSize:13, lineHeight:1.65, maxWidth:"82%" },
-  bubTextU:{ background:"linear-gradient(135deg,#1d4ed8,#3b82f6)", border:"none", borderRadius:"11px 4px 11px 11px", color:"#ddeeff" },
-  chatBar:{ display:"flex", gap:7, padding:"9px 12px", borderTop:`1px solid ${BORD}`, background:"rgba(0,0,0,.3)" },
-  chatIn:{ flex:1, background:"rgba(255,255,255,.05)", border:`1px solid rgba(255,255,255,.09)`, borderRadius:10, padding:"8px 12px", color:TXT, fontSize:13, outline:"none" },
-  sendBtn:{ width:38, height:38, borderRadius:10, background:"linear-gradient(135deg,#1d4ed8,#3b82f6)", border:"none", color:"#fff", fontSize:14, cursor:"pointer", flexShrink:0, fontWeight:700 },
-  scanWrap:{ padding:22, display:"flex", flexDirection:"column", alignItems:"center", gap:14, minHeight:"70vh", overflowY:"auto" },
-  scanRing:{ width:80, height:80, borderRadius:"50%", background:"rgba(37,99,235,.1)", border:"2px solid rgba(96,165,250,.15)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:36 },
-  spinner:{ width:40, height:40, border:"3px solid rgba(255,255,255,.07)", borderTop:"3px solid #60a5fa", borderRadius:"50%", animation:"spin .8s linear infinite" },
-  scard:{ background:"rgba(255,255,255,.03)", border:`1px solid ${BORD}`, borderRadius:13, padding:"13px 10px", textAlign:"center" },
-  alertR:{ background:"rgba(239,68,68,.1)", border:"1px solid rgba(239,68,68,.2)", borderRadius:10, padding:"8px 12px", fontSize:12, color:"#fca5a5", marginBottom:12 },
-  card:{ background:"rgba(255,255,255,.02)", border:`1px solid ${BORD}`, borderRadius:12, padding:12, marginBottom:12 },
-  cardHd:{ fontSize:11, fontWeight:700, color:"#6090b0", marginBottom:8, textTransform:"uppercase", letterSpacing:".5px" },
-  row:{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"5px 0", borderBottom:`1px solid rgba(255,255,255,.03)`, fontSize:13 },
-  icard:{ background:"rgba(255,255,255,.025)", border:`1px solid ${BORD}`, borderRadius:13, padding:11, animation:"fadeUp .3s ease" },
-  fchip:{ background:"rgba(255,255,255,.03)", border:`1px solid ${BORD}`, borderRadius:8, padding:"4px 10px", color:MUT, fontSize:11, cursor:"pointer", whiteSpace:"nowrap", flexShrink:0 },
-  sortDrop:{ position:"absolute", right:0, top:36, background:PANEL, border:`1px solid ${BORD}`, borderRadius:11, zIndex:100, minWidth:150, boxShadow:"0 8px 28px rgba(0,0,0,.6)", overflow:"hidden" },
-  sortOpt:{ display:"block", width:"100%", background:"none", border:"none", borderBottom:`1px solid ${BORD}`, padding:"9px 13px", color:"#ccd9ee", fontSize:12, cursor:"pointer", textAlign:"left" },
-  qbtn:{ background:"rgba(255,255,255,.04)", border:`1px solid ${BORD}`, borderRadius:12, padding:"12px 8px", cursor:"pointer", textAlign:"center", color:TXT },
-};
