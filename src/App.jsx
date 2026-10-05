@@ -446,6 +446,7 @@ function SettingsModal({ syncStatus, syncDetail, onClose, onRestore, onExport, o
         <button style={{ ...st.btnGhost, width:"100%", marginTop:6 }} onClick={()=>{ setAccessCode(code); toast("Saved", "ok"); }}>Save access code</button>
       </Field>
       <button style={{ ...st.btnGhost, width:"100%", marginTop:6 }} onClick={onClose}>Close</button>
+      <div style={{ textAlign:"center", fontSize:11, color:MUT, marginTop:10 }}>Version {typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "dev"}</div>
     </Modal>
   );
 }

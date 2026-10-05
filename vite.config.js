@@ -3,10 +3,13 @@ import react from "@vitejs/plugin-react";
 import { VitePWA } from "vite-plugin-pwa";
 
 export default defineConfig({
+  // Shown in ⚙️ so you can tell exactly which build a phone is running.
+  define: { __APP_VERSION__: JSON.stringify((process.env.VERCEL_GIT_COMMIT_SHA || "dev").slice(0, 7)) },
   plugins: [
     react(),
     VitePWA({
       registerType: "autoUpdate",
+      injectRegister: false,        // registration happens in src/main.jsx (reloads on update)
       includeAssets: ["icon.svg", "apple-touch-icon.png"],
       manifest: {
         name: "Consumables — AI Inventory",

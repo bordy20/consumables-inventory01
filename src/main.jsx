@@ -1,6 +1,20 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { registerSW } from "virtual:pwa-register";
 import App from "./App.jsx";
+
+// Keep the installed app current: when a new build is deployed the service worker
+// updates and the page reloads itself (data is already saved locally + in the cloud).
+// Also look for a new build every time the app comes back to the foreground.
+registerSW({
+  immediate: true,
+  onRegisteredSW(_url, reg) {
+    if (!reg) return;
+    const check = () => reg.update().catch(() => {});
+    document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") check(); });
+    setInterval(check, 30 * 60 * 1000);
+  },
+});
 
 // A render error should never leave a blank screen on a phone — show a recovery
 // screen instead. Data is safe: it lives in local storage and in the cloud.
