@@ -180,8 +180,8 @@ async function aiChat(messages, inventory) {
   const res = await apiFetch("/api/chat", { method: "POST", body: JSON.stringify({ messages, inventory }) });
   if (!res.ok) throw new Error("chat " + res.status);          // → caller falls back to the offline answer
   const data = await res.json();
-  if (!data.reply) throw new Error("empty reply");
-  return data.reply;
+  if (!data.reply && !(data.actions || []).length) throw new Error("empty reply");
+  return { reply: data.reply || "", actions: data.actions || [] };
 }
 
 // ─── Reusable UI ───────────────────────────────────────────────────────────────
@@ -407,7 +407,7 @@ function LockScreen({ onUnlock }) {
 
 // ─── Settings: sync key backup/restore, access code, status ───────────────────
 const SYNC_LABEL = { loading:"Loading…", synced:"✅ Synced", saving:"⏳ Saving…", offline:"📴 Offline — will sync when back online", error:"⚠️ Can't reach server — retrying", locked:"🔒 Locked" };
-function SettingsModal({ syncStatus, onClose, onRestore, onExport, onImport, toast }) {
+function SettingsModal({ syncStatus, syncDetail, onClose, onRestore, onExport, onImport, toast }) {
   const myKey = getUserId();
   const [other, setOther] = useState("");
   const [code, setCode] = useState(getAccessCode());
@@ -418,7 +418,10 @@ function SettingsModal({ syncStatus, onClose, onRestore, onExport, onImport, toa
   return (
     <Modal onClose={onClose}>
       <div style={{ fontSize:15, fontWeight:700, marginBottom:12 }}>⚙️ Settings</div>
-      <Field label="Sync status"><div style={{ fontSize:13 }}>{SYNC_LABEL[syncStatus] || syncStatus}</div></Field>
+      <Field label="Sync status">
+        <div style={{ fontSize:13 }}>{SYNC_LABEL[syncStatus] || syncStatus}</div>
+        {syncDetail && syncStatus !== "synced" && <div style={{ fontSize:12, color:"#fbbf24", marginTop:4, lineHeight:1.5 }}>{syncDetail}. Your changes are saved on this phone and will upload when it works again.</div>}
+      </Field>
       <Field label="Your sync key — keep it private">
         <div style={{ ...st.inp, wordBreak:"break-all", userSelect:"all", WebkitUserSelect:"all", fontSize:13 }}>{myKey}</div>
         <button style={{ ...st.btnGhost, width:"100%", marginTop:6 }} onClick={copy}>📋 Copy key</button>
@@ -457,6 +460,7 @@ export default function App() {
   const [loaded,   setLoaded]   = useState(false);
   const [tab,      setTab]      = useState("home");
   const [syncStatus,   setSyncStatus]   = useState("loading");
+  const [syncDetail,   setSyncDetail]   = useState("");
   const [locked,       setLocked]       = useState(false);
   const [showSettings, setShowSettings] = useState(false);
 
@@ -498,6 +502,7 @@ export default function App() {
   const syncRef     = useRef(null);
   const skipSave    = useRef(true);     // don't echo data that just arrived from the server back to it
   const itemsRef    = useRef(items);    itemsRef.current = items;
+  const shopRef     = useRef(shopList); shopRef.current = shopList;
   const tombRef     = useRef(tomb);     tombRef.current = tomb;
 
   const applyRemote = useCallback((d) => {
@@ -506,7 +511,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const sync = createSync({ onRemote: applyRemote, onStatus: setSyncStatus });
+    const sync = createSync({ onRemote: applyRemote, onStatus: (s, d) => { setSyncStatus(s); setSyncDetail(d || ""); } });
     syncRef.current = sync;
     const onLocked = () => setLocked(true);
     window.addEventListener(LOCKED_EVENT, onLocked);
@@ -618,6 +623,37 @@ export default function App() {
     return items.length ? `📊 **${items.length} products** tracked.\n${items.filter(i=>i.qty<=(i.minQty||1)).length > 0 ? `⚠️ ${items.filter(i=>i.qty<=(i.minQty||1)).length} items need restocking.` : "✅ All stocked up!"}\n\nAsk me *"what's low?"* or *"show inventory"*` : "📦 Inventory empty! Go to **Scan** to add products.";
   }, [items, shopList]);
 
+  // Apply changes the chat assistant asked for. Returns one human-readable line per action.
+  const findItem = (name) => {
+    const q = name.trim().toLowerCase(), list = itemsRef.current;
+    const exact = list.find(i => i.name.toLowerCase() === q);
+    if (exact) return exact;
+    const near = list.filter(i => i.name.toLowerCase().includes(q) || q.includes(i.name.toLowerCase()));
+    return near.length === 1 ? near[0] : null;     // ambiguous → don't guess
+  };
+  const applyActions = (actions) => {
+    const lines = [];
+    for (const a of actions || []) {
+      if (a.type === "adjust_quantity") {
+        const it = findItem(a.name);
+        if (!it) { lines.push(`❓ I couldn't find "${a.name}" in your inventory — nothing changed.`); continue; }
+        const next = Math.max(0, it.qty + a.delta);
+        const saved = updateItem(it.id, { qty: next });
+        lines.push(`${it.emoji || "📦"} **${it.name}**: ${it.qty} → ${next}`);
+        if (saved) alertLow([saved]);
+      } else if (a.type === "add_item") {
+        addItem({ name:a.name, qty:a.quantity, category:a.category, unit:a.unit, emoji:C_ICO[a.category] || "📦", minQty:1, expiry:"", notes:"", brand:"" });
+        lines.push(`🆕 Added ${a.quantity} × **${a.name}**`);
+      } else if (a.type === "add_to_shopping_list") {
+        const list = shopRef.current, idx = list.findIndex(l => l.name.toLowerCase() === a.name.toLowerCase());
+        const nextList = idx >= 0 ? list.map((l, i) => i === idx ? { ...l, qty: l.qty + a.quantity } : l) : [...list, { name:a.name, qty:a.quantity }];
+        shopRef.current = nextList; updateShop(nextList);
+        lines.push(`🛒 **${a.name}** ×${a.quantity} added to your shopping list`);
+      }
+    }
+    return lines;
+  };
+
   const sendChat = async (txt) => {
     const text = (txt ?? chatInput).trim(); if (!text || chatBusy) return;
     setChatInput("");
@@ -625,10 +661,17 @@ export default function App() {
     setMsgs(p => [...p, um]);
     setChatBusy(true);
     try {
-      const reply = await aiChat([...msgs, um], items);
-      setMsgs(p => [...p, { role:"assistant", text:reply, id:Date.now() }]);
+      const { reply, actions } = await aiChat([...msgs, um], items);
+      const done = applyActions(actions);
+      const out = [reply, done.join("\n")].filter(Boolean).join("\n\n");
+      setMsgs(p => [...p, { role:"assistant", text:out, id:Date.now() }]);
     } catch {
-      setMsgs(p => [...p, { role:"assistant", text:offlineReply(text), id:Date.now() }]);
+      // Never let a failed AI call look like a successful edit.
+      const wantsChange = /\b(remove|add|use[ds]?|bought|buy|took|finished|consumed|minus|deduct|restock|got)\b/i.test(text);
+      const msg = wantsChange
+        ? "⚠️ I couldn't reach the AI, so **nothing was changed**. Use the − / + buttons on the Items tab, or try again in a moment."
+        : offlineReply(text);
+      setMsgs(p => [...p, { role:"assistant", text:msg, id:Date.now() }]);
     } finally { setChatBusy(false); }
   };
 
@@ -696,7 +739,7 @@ export default function App() {
       <Toast list={toasts}/>
 
       {showSettings && (
-        <SettingsModal syncStatus={syncStatus} toast={toast} onClose={()=>setShowSettings(false)}
+        <SettingsModal syncStatus={syncStatus} syncDetail={syncDetail} toast={toast} onClose={()=>setShowSettings(false)}
           onExport={doExport} onImport={()=>importRef.current?.click()}
           onRestore={()=>window.location.reload()} />
       )}

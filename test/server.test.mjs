@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { cleanChat, cleanInventory, cleanScan, cleanStr, gate, USER_ID_RE } from "../server/lib.js";
+import { cleanChat, cleanInventory, cleanScan, cleanStr, cleanActions, CHAT_TOOLS, gate, USER_ID_RE } from "../server/lib.js";
 
 function mockRes() {
   return { code: 200, body: null, headers: {},
@@ -83,4 +83,33 @@ test("gate: rejects wrong method, bad id, and wrong access code", () => {
   r = mockRes();
   assert.equal(gate({ method: "GET", headers: { "x-user-id": "abcdefgh1234", "x-access-code": "s3cret" } }, r, ["GET"]), "abcdefgh1234");
   delete process.env.APP_ACCESS_CODE;
+});
+
+test("chat actions: 'remove 2 water' becomes a validated adjust_quantity", () => {
+  const acts = cleanActions([
+    { type: "text", text: "Done!" },
+    { type: "tool_use", name: "adjust_quantity", input: { name: "Drinking Water", delta: -2 } },
+  ]);
+  assert.deepEqual(acts, [{ type: "adjust_quantity", name: "Drinking Water", delta: -2 }]);
+});
+
+test("chat actions: junk, zero deltas and unknown tools are dropped; values are clamped", () => {
+  const acts = cleanActions([
+    { type: "tool_use", name: "adjust_quantity", input: { name: "A", delta: 0 } },
+    { type: "tool_use", name: "adjust_quantity", input: { name: "", delta: 1 } },
+    { type: "tool_use", name: "adjust_quantity", input: { name: "B", delta: -100000 } },
+    { type: "tool_use", name: "delete_everything", input: { name: "C" } },
+    { type: "tool_use", name: "add_item", input: { name: "Milk", quantity: 5000, category: "Nope", unit: "zzz" } },
+    { type: "tool_use", name: "add_to_shopping_list", input: { name: "Rice" } },
+  ]);
+  assert.deepEqual(acts, [
+    { type: "adjust_quantity", name: "B", delta: -999 },
+    { type: "add_item", name: "Milk", quantity: 999, category: "Other", unit: "piece" },
+    { type: "add_to_shopping_list", name: "Rice", quantity: 1 },
+  ]);
+  assert.deepEqual(cleanActions(null), []);
+});
+
+test("chat tools expose no destructive action", () => {
+  assert.deepEqual(CHAT_TOOLS.map(t => t.name).sort(), ["add_item", "add_to_shopping_list", "adjust_quantity"]);
 });

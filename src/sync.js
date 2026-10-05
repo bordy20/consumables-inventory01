@@ -70,7 +70,14 @@ export function createSync({ onRemote, onStatus }) {
   let inflight = false;
   let backoff = 0;
 
-  const status = s => onStatus?.(s);
+  const status = (s, detail = "") => onStatus?.(s, detail);
+  // Human-readable reason shown in Settings when syncing fails.
+  const why = (e) => {
+    const m = /^(?:pull|save) (\d+)$/.exec(e?.message || "");
+    if (m) return m[1] === "500" ? "Server error (500) — check the storage connection in Vercel" : `Server responded ${m[1]}`;
+    return navigator.onLine === false ? "No internet connection" : "Couldn't reach the server";
+  };
+  const failStatus = () => (navigator.onLine === false ? "offline" : "error");
 
   async function pull() {
     const res = await apiFetch("/api/inventory");
@@ -89,8 +96,8 @@ export function createSync({ onRemote, onStatus }) {
       adopt(remote);
       status(dirty ? "saving" : "synced");
       if (dirty) flush();
-    } catch {
-      status(navigator.onLine === false ? "offline" : cache ? "offline" : "error");
+    } catch (e) {
+      status(failStatus(), why(e));
     }
   }
 
@@ -115,7 +122,7 @@ export function createSync({ onRemote, onStatus }) {
 
   async function flush() {
     if (inflight || !dirty || !latest) return;
-    if (navigator.onLine === false) return status("offline");
+    if (navigator.onLine === false) return status("offline", "No internet connection");
     inflight = true;
     try {
       const snapshot = latest;
@@ -135,8 +142,8 @@ export function createSync({ onRemote, onStatus }) {
       backoff = 0;
       status(dirty ? "saving" : "synced");
       if (dirty) { inflight = false; return flush(); }
-    } catch {
-      status(navigator.onLine === false ? "offline" : "error");
+    } catch (e) {
+      status(failStatus(), why(e));
       backoff = Math.min(60000, (backoff || 2000) * 2);
       clearTimeout(timer);
       timer = setTimeout(flush, backoff);   // keep trying; local copy is safe
@@ -149,12 +156,12 @@ export function createSync({ onRemote, onStatus }) {
     try {
       const remote = await pull();
       if (remote) { adopt(remote); status(dirty ? "saving" : "synced"); if (dirty) flush(); }
-    } catch { status(navigator.onLine === false ? "offline" : "error"); }
+    } catch (e) { status(failStatus(), why(e)); }
   }
 
   const onVisible = () => { if (document.visibilityState === "visible") refresh(); };
   const onOnline  = () => refresh();
-  const onOffline = () => status("offline");
+  const onOffline = () => status("offline", "No internet connection");
   document.addEventListener("visibilitychange", onVisible);
   window.addEventListener("online", onOnline);
   window.addEventListener("offline", onOffline);

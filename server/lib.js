@@ -143,6 +143,52 @@ export function cleanChat(messages) {
   return out;
 }
 
+/**
+ * Actions the chat assistant may ask the app to perform. They are only
+ * *proposed* here; the client applies them to the user's own inventory.
+ * Nothing destructive (no item deletion) is offered.
+ */
+export const CHAT_TOOLS = [
+  {
+    name: "adjust_quantity",
+    description: "Change the stock count of an item that is already in the inventory. Use a negative delta to remove/use up units (e.g. 'remove 2 water' → delta -2) and a positive delta to add units. Use the item's exact name from the inventory list.",
+    input_schema: { type: "object", properties: { name: { type: "string" }, delta: { type: "integer", description: "Units to add (positive) or remove (negative)" } }, required: ["name", "delta"] },
+  },
+  {
+    name: "add_item",
+    description: "Add a product that is NOT in the inventory yet.",
+    input_schema: { type: "object", properties: {
+      name: { type: "string" }, quantity: { type: "integer", minimum: 1 },
+      category: { type: "string", enum: CATS }, unit: { type: "string", enum: UNITS } }, required: ["name"] },
+  },
+  {
+    name: "add_to_shopping_list",
+    description: "Put an item on the shopping list.",
+    input_schema: { type: "object", properties: { name: { type: "string" }, quantity: { type: "integer", minimum: 1 } }, required: ["name"] },
+  },
+];
+
+/** Validate the tool calls in a model response and turn them into plain actions. */
+export function cleanActions(content) {
+  const out = [];
+  for (const b of Array.isArray(content) ? content : []) {
+    if (b?.type !== "tool_use" || !b.input || out.length >= 10) continue;
+    const name = cleanStr(b.input.name, 80);
+    if (!name) continue;
+    if (b.name === "adjust_quantity") {
+      const delta = Math.trunc(Number(b.input.delta));
+      if (Number.isFinite(delta) && delta !== 0) out.push({ type: "adjust_quantity", name, delta: Math.max(-999, Math.min(999, delta)) });
+    } else if (b.name === "add_item") {
+      out.push({ type: "add_item", name, quantity: num(b.input.quantity, 1, 999, 1),
+        category: CATS.includes(b.input.category) ? b.input.category : "Other",
+        unit: UNITS.includes(b.input.unit) ? b.input.unit : "piece" });
+    } else if (b.name === "add_to_shopping_list") {
+      out.push({ type: "add_to_shopping_list", name, quantity: num(b.input.quantity, 1, 999, 1) });
+    }
+  }
+  return out;
+}
+
 export async function callClaude(body, ms = 25000) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw Object.assign(new Error("API key not configured"), { status: 500 });

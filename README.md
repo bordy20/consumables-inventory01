@@ -14,6 +14,8 @@ Stack: Vite + React (PWA) · Vercel serverless functions · Vercel KV / Upstash 
    - `ANTHROPIC_MODEL` — optional override (default `claude-haiku-4-5-20251001`).
 4. Redeploy.
 
+> **Preview deployments** (pull request branches) only get the environment variables and storage you enable for the **Preview** environment. If a preview shows an empty inventory and an orange/red ⚙️ dot, connect the storage to Preview too and redeploy.
+
 ## Install on your phone
 
 - **iPhone:** open the site in **Safari** → Share → **Add to Home Screen**.
@@ -33,6 +35,8 @@ Your items appear. Do the same on any other phone to share one inventory. Treat 
 - **Security:** same-origin only (no wildcard CORS), optional access code, per-IP and per-user rate limits on all routes, server-side validation/size caps, safe error messages, AI output normalised, HTML-escaped chat rendering.
 - **Fixed:** chat sent the assistant greeting as the first message (rejected by the API) and then crashed on the empty reply — now fixed with an offline fallback.
 - **Sync:** versioned saves with automatic merge (newest edit per item wins, deletions propagate), offline queue with retry, refresh when the app returns to the foreground, sync status dot in ⚙️.
+- **Chat can change stock:** say "remove 2 water", "I bought 3 rice" or "add milk to my shopping list". Only quantity changes, adding items and the shopping list are allowed (no deletes), and the chat shows before → after. If the AI can't be reached it says nothing was changed.
+- **Sync status:** ⚙️ shows why syncing failed (e.g. "Server error (500) — check the storage connection").
 - **Phone UX:** installable PWA with offline app shell, bottom tab bar, safe-area support (notch / home bar), 16px inputs (no iOS zoom), larger touch targets, camera **and** photo-library pickers, native share sheet for backup/shopping list, error screen instead of a blank page.
 
 ## Develop
