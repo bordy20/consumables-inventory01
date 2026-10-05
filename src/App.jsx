@@ -1,18 +1,14 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
+import { createSync, apiFetch, getUserId, setUserId, getAccessCode, setAccessCode, LOCKED_EVENT } from "./sync.js";
 
 // ─── Config ────────────────────────────────────────────────────────────────────
-const STORE_KEY   = "cons-v10";
-const USER_ID_KEY = "cons-uid";
-
-function getUserId() {
-  let id = localStorage.getItem(USER_ID_KEY);
-  if (!id) {
-    id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-    localStorage.setItem(USER_ID_KEY, id);
-  }
-  return id;
-}
-const CATS  = ["Oral Care","Toilet Paper","Personal Care","Cleaning","Food & Beverage","Medicine","Other"];
+const nid = () => Date.now() * 1000 + Math.floor(Math.random() * 1000);   // collision-safe numeric id
+const localISO = (daysAhead = 0) => {                                      // YYYY-MM-DD in the phone's local time
+  const d = new Date(Date.now() + daysAhead * 864e5);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+const CATS = ["Oral Care","Toilet Paper","Personal Care","Cleaning","Food & Beverage","Medicine","Other"];
 const UNITS = ["piece","pack","bottle","tube","roll","bar","box","can","bag","sachet","set","pair"];
 const C_ICO = {"Oral Care":"🦷","Toilet Paper":"🧻","Personal Care":"🧴","Cleaning":"🧹","Food & Beverage":"🥫","Medicine":"💊","Other":"📦"};
 const C_CLR = {"Oral Care":"#3b82f6","Toilet Paper":"#8b5cf6","Personal Care":"#ec4899","Cleaning":"#10b981","Food & Beverage":"#f59e0b","Medicine":"#ef4444","Other":"#6b7280"};
@@ -155,11 +151,8 @@ async function compressImage(dataUrl, maxPx = 800, quality = 0.85) {
 async function aiScan(dataUrl) {
   const { dataUrl: compressed } = await compressImage(dataUrl);
   const b64 = compressed.split(",")[1];
-  const response = await fetch("/api/scan", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ image: b64 }),
-  });
+  const response = await apiFetch("/api/scan", { method: "POST", body: JSON.stringify({ image: b64 }) });
+  if (!response.ok) return null;
   const obj = await response.json();
   if (obj.error || !obj.name) return null;
   return obj;
@@ -184,41 +177,12 @@ async function scanPipeline(dataUrl, filename) {
 }
 
 async function aiChat(messages, inventory) {
-  const res = await fetch("/api/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ messages, inventory }),
-  });
+  const res = await apiFetch("/api/chat", { method: "POST", body: JSON.stringify({ messages, inventory }) });
+  if (!res.ok) throw new Error("chat " + res.status);          // → caller falls back to the offline answer
   const data = await res.json();
-  return data.reply || null;
+  if (!data.reply) throw new Error("empty reply");
+  return data.reply;
 }
-
-// ─── Cloud Storage (Vercel KV) with local cache fallback ─────────────────────
-const db = {
-  // Load: try cloud first, fall back to localStorage cache if offline
-  async load(uid) {
-    try {
-      const res = await fetch("/api/inventory?userId=" + uid);
-      if (res.ok) {
-        const data = await res.json();
-        if (data && Array.isArray(data.items)) {
-          localStorage.setItem(STORE_KEY, JSON.stringify(data));
-          return data;
-        }
-      }
-    } catch {}
-    try { const c = localStorage.getItem(STORE_KEY); return c ? JSON.parse(c) : null; } catch { return null; }
-  },
-  // Save: local cache instantly + cloud in background
-  save(uid, data) {
-    try { localStorage.setItem(STORE_KEY, JSON.stringify(data)); } catch {}
-    fetch("/api/inventory?userId=" + uid, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    }).catch(() => {});
-  },
-};
 
 // ─── Reusable UI ───────────────────────────────────────────────────────────────
 function Toast({ list }) {
@@ -364,10 +328,15 @@ function ShopTab({ items, shopList, setShopList }) {
     setSName(""); setSQty(1);
   };
 
-  const exportList = () => {
-    const a = document.createElement("a");
-    a.href = "data:text/plain;charset=utf-8," + encodeURIComponent("SHOPPING LIST\n" + new Date().toLocaleDateString() + "\n\n" + shopList.map(i=>`${i.checked?"✓":"○"} ${i.name}  ×${i.qty}`).join("\n"));
-    a.download = "shopping-list.txt"; a.click();
+  const exportList = async () => {
+    const text = "SHOPPING LIST\n" + new Date().toLocaleDateString() + "\n\n" + shopList.map(i=>`${i.checked?"✓":"○"} ${i.name}  ×${i.qty}`).join("\n");
+    try {   // phones: share sheet (Messages, Notes, WhatsApp…)
+      if (navigator.share) { await navigator.share({ title:"Shopping list", text }); return; }
+    } catch (e) { if (e?.name === "AbortError") return; }
+    try { await navigator.clipboard.writeText(text); alert("Shopping list copied to clipboard"); return; } catch {}
+    const url = URL.createObjectURL(new Blob([text], { type:"text/plain" }));
+    const a = document.createElement("a"); a.href = url; a.download = "shopping-list.txt"; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   return (
@@ -421,13 +390,75 @@ function ShopTab({ items, shopList, setShopList }) {
   );
 }
 
+// ─── Lock screen (shown when the server has APP_ACCESS_CODE set) ───────────────
+function LockScreen({ onUnlock }) {
+  const [code, setCode] = useState("");
+  return (
+    <div style={{ ...st.root, alignItems:"center", justifyContent:"center", padding:24, textAlign:"center" }}>
+      <div style={{ fontSize:48 }}>🔒</div>
+      <h2 style={{ fontSize:18, fontWeight:700, margin:"12px 0 6px" }}>Consumables</h2>
+      <p style={{ fontSize:13, color:MUT, marginBottom:16, maxWidth:260 }}>Enter your access code to continue.</p>
+      <input style={{ ...st.inp, maxWidth:260, textAlign:"center" }} type="password" autoComplete="current-password" autoFocus
+        value={code} onChange={e=>setCode(e.target.value)} onKeyDown={e=>e.key==="Enter"&&code&&onUnlock(code)} placeholder="Access code" />
+      <button style={{ ...st.bigBtn, marginTop:12, maxWidth:260, opacity:code?1:.4 }} disabled={!code} onClick={()=>onUnlock(code)}>Unlock</button>
+    </div>
+  );
+}
+
+// ─── Settings: sync key backup/restore, access code, status ───────────────────
+const SYNC_LABEL = { loading:"Loading…", synced:"✅ Synced", saving:"⏳ Saving…", offline:"📴 Offline — will sync when back online", error:"⚠️ Can't reach server — retrying", locked:"🔒 Locked" };
+function SettingsModal({ syncStatus, onClose, onRestore, onExport, onImport, toast }) {
+  const myKey = getUserId();
+  const [other, setOther] = useState("");
+  const [code, setCode] = useState(getAccessCode());
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(myKey); toast("📋 Sync key copied", "ok"); }
+    catch { toast("Press and hold the key to copy it", "info"); }
+  };
+  return (
+    <Modal onClose={onClose}>
+      <div style={{ fontSize:15, fontWeight:700, marginBottom:12 }}>⚙️ Settings</div>
+      <Field label="Sync status"><div style={{ fontSize:13 }}>{SYNC_LABEL[syncStatus] || syncStatus}</div></Field>
+      <Field label="Your sync key — keep it private">
+        <div style={{ ...st.inp, wordBreak:"break-all", userSelect:"all", WebkitUserSelect:"all", fontSize:13 }}>{myKey}</div>
+        <button style={{ ...st.btnGhost, width:"100%", marginTop:6 }} onClick={copy}>📋 Copy key</button>
+        <div style={{ fontSize:11, color:MUT, marginTop:6, lineHeight:1.5 }}>
+          Your inventory is stored under this key. Installing to the home screen (iPhone) or switching phones starts with an empty
+          app — paste this key there to get your data back.
+        </div>
+      </Field>
+      <Field label="Use a different sync key (replaces this device's data)">
+        <input style={st.inp} value={other} onChange={e=>setOther(e.target.value.trim())} placeholder="Paste sync key" autoCapitalize="off" autoCorrect="off" spellCheck={false} />
+        <button style={{ ...st.btnBlue, width:"100%", marginTop:6, opacity:other.length>=8?1:.4 }} disabled={other.length<8}
+          onClick={()=>{ if (setUserId(other)) onRestore(); else toast("❌ Invalid key", "danger"); }}>Switch to this key</button>
+      </Field>
+      <Field label="Backup file">
+        <div style={{ display:"flex", gap:8 }}>
+          <button style={{ ...st.btnGhost, flex:1 }} onClick={onExport}>📤 Export</button>
+          <button style={{ ...st.btnGhost, flex:1 }} onClick={onImport}>📥 Import</button>
+        </div>
+      </Field>
+      <Field label="Access code (if your server requires one)">
+        <input style={st.inp} type="password" value={code} onChange={e=>setCode(e.target.value)} placeholder="Not set" autoComplete="off" />
+        <button style={{ ...st.btnGhost, width:"100%", marginTop:6 }} onClick={()=>{ setAccessCode(code); toast("Saved", "ok"); }}>Save access code</button>
+      </Field>
+      <button style={{ ...st.btnGhost, width:"100%", marginTop:6 }} onClick={onClose}>Close</button>
+    </Modal>
+  );
+}
+
 // ─── Main App ──────────────────────────────────────────────────────────────────
 export default function App() {
   // All state at top level — no hooks inside JSX
   const [items,    setItems]    = useState([]);
   const [shopList, setShopList] = useState([]);
+  const [tomb,     setTomb]     = useState([]);          // deleted-item markers for multi-device merge
+  const [shopU,    setShopU]    = useState(0);           // shopping list last-modified
   const [loaded,   setLoaded]   = useState(false);
   const [tab,      setTab]      = useState("home");
+  const [syncStatus,   setSyncStatus]   = useState("loading");
+  const [locked,       setLocked]       = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
 
   // Chat
   const [msgs,      setMsgs]      = useState([{ role:"assistant", id:0, text:"👋 Hi! I'm **Consumables AI**.\n\n📷 **Scan** — photo a product to auto-identify it\n⚡ **Quick Add** — tap common items instantly\n📦 **Items** — manage your inventory\n🛒 **Shop** — shopping list\n📊 **Home** — stock overview\n\nWhat would you like to do?" }]);
@@ -441,6 +472,7 @@ export default function App() {
   const [scanData, setScanData] = useState(null);
   const [scanSource, setScanSource] = useState(""); // "ai" | "local" | "none"
   const fileRef = useRef(null);
+  const galleryRef = useRef(null);
   const [showQuick, setShowQuick] = useState(false);
 
   // Items tab
@@ -462,16 +494,35 @@ export default function App() {
 
   const importRef = useRef(null);
 
-  // Persist
-  const userIdRef = useRef(getUserId());
-  useEffect(() => {
-    db.load(userIdRef.current).then(d => {
-      if (d) { setItems(d.items||[]); setShopList(d.shop||[]); }
-      setLoaded(true);
-    });
+  // Persist: local cache + versioned cloud sync (see sync.js)
+  const syncRef     = useRef(null);
+  const skipSave    = useRef(true);     // don't echo data that just arrived from the server back to it
+  const itemsRef    = useRef(items);    itemsRef.current = items;
+  const tombRef     = useRef(tomb);     tombRef.current = tomb;
+
+  const applyRemote = useCallback((d) => {
+    skipSave.current = true;
+    setItems(d.items||[]); setShopList(d.shop||[]); setTomb(d.tomb||[]); setShopU(d.shopU||0);
   }, []);
-  useEffect(() => { if(loaded) db.save(userIdRef.current, { items, shop:shopList }); }, [items, shopList, loaded]);
+
+  useEffect(() => {
+    const sync = createSync({ onRemote: applyRemote, onStatus: setSyncStatus });
+    syncRef.current = sync;
+    const onLocked = () => setLocked(true);
+    window.addEventListener(LOCKED_EVENT, onLocked);
+    sync.init().finally(() => setLoaded(true));
+    return () => { window.removeEventListener(LOCKED_EVENT, onLocked); sync.destroy(); };
+  }, [applyRemote]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    if (skipSave.current) { skipSave.current = false; return; }
+    syncRef.current?.save({ items, shop:shopList, tomb, shopU });
+  }, [items, shopList, tomb, shopU, loaded]);
+
   useEffect(() => { chatEnd.current?.scrollIntoView({ behavior:"smooth" }); }, [msgs]);
+
+  const unlock = (code) => { setAccessCode(code); setLocked(false); syncRef.current?.init(); };
 
   const alertLow = useCallback((arr) => {
     arr.forEach(i => {
@@ -480,20 +531,38 @@ export default function App() {
     });
   }, [toast]);
 
+  // All item mutations go through here so every change is time-stamped (`u`) for merging.
+  const stamp = x => ({ ...x, u: Date.now() });
+
+  const updateItem = useCallback((id, patch) => {
+    const prev = itemsRef.current;
+    const next = prev.map(x => x.id === id ? stamp({ ...x, ...(typeof patch === "function" ? patch(x) : patch) }) : x);
+    itemsRef.current = next; setItems(next);
+    return next.find(x => x.id === id);
+  }, []);
+
+  const removeItem = useCallback((id) => {
+    setItems(itemsRef.current = itemsRef.current.filter(x => x.id !== id));
+    setTomb(tombRef.current = [...tombRef.current.filter(t => t.id !== id), { id, u: Date.now() }]);
+  }, []);
+
+  const updateShop = useCallback((list) => { setShopList(list); setShopU(Date.now()); }, []);
+
   const addItem = useCallback((p) => {
-    setItems(prev => {
-      const idx = prev.findIndex(x => x.name.toLowerCase() === p.name.toLowerCase());
-      let next;
-      if (idx >= 0) {
-        next = prev.map((x,i) => i===idx ? { ...x, qty: x.qty+(p.qty||1) } : x);
-        toast(`✅ +${p.qty||1} ${p.name} (total ${prev[idx].qty+(p.qty||1)})`, "ok");
-      } else {
-        next = [...prev, { ...p, id:Date.now(), added:new Date().toLocaleDateString() }];
-        toast(`🆕 ${p.name} added!`, "ok");
-      }
-      alertLow(next.filter(x => x.name === p.name));
-      return next;
-    });
+    const prev = itemsRef.current;
+    const idx = prev.findIndex(x => x.name.toLowerCase() === p.name.toLowerCase());
+    let next, touched;
+    if (idx >= 0) {
+      touched = stamp({ ...prev[idx], qty: prev[idx].qty + (p.qty||1) });
+      next = prev.map((x,i) => i===idx ? touched : x);
+      toast(`✅ +${p.qty||1} ${p.name} (total ${touched.qty})`, "ok");
+    } else {
+      touched = stamp({ ...p, id: nid(), added: new Date().toLocaleDateString() });
+      next = [...prev, touched];
+      toast(`🆕 ${p.name} added!`, "ok");
+    }
+    itemsRef.current = next; setItems(next);
+    alertLow([touched]);
   }, [toast, alertLow]);
 
   // Scan
@@ -541,7 +610,7 @@ export default function App() {
     if (q.match(/shop|buy|shopping/))
       return shopList.length ? `🛒 **Shopping list:**\n${shopList.map(i=>`• ${i.name} ×${i.qty}`).join("\n")}` : "🛒 Shopping list is empty.";
     if (q.match(/expir/)) {
-      const week = new Date(Date.now()+7*864e5).toISOString().slice(0,10);
+      const week = localISO(7);
       const e = items.filter(i=>i.expiry&&i.expiry<=week);
       return e.length ? `⏰ **Expiring soon:**\n${e.map(i=>`• ${i.emoji} ${i.name} — ${i.expiry}`).join("\n")}` : "✅ Nothing expiring soon!";
     }
@@ -579,24 +648,66 @@ export default function App() {
 
   const activeCats = ["All", ...CATS.filter(c=>items.some(i=>i.category===c))];
   const lowCount   = items.filter(i=>i.qty<=(i.minQty||1)).length;
-  const week       = new Date(Date.now()+7*864e5).toISOString().slice(0,10);
-  const md = t => t.split("\n").map((l,i,a)=><span key={i} dangerouslySetInnerHTML={{ __html: l.replace(/\*\*(.*?)\*\*/g,"<strong>$1</strong>")+(i<a.length-1?"<br/>":"") }}/>);
+  const week       = localISO(7);
+  // Escape first (item names and AI text are untrusted), then allow only **bold**.
+  const md = t => String(t ?? "").split("\n").map((l,i,a)=><span key={i} dangerouslySetInnerHTML={{ __html: esc(l).replace(/\*\*(.*?)\*\*/g,"<strong>$1</strong>")+(i<a.length-1?"<br/>":"") }}/>);
 
-  const doExport = () => { const a=document.createElement("a"); a.href="data:application/json;charset=utf-8,"+encodeURIComponent(JSON.stringify({items,shop:shopList},null,2)); a.download=`consumables-${Date.now()}.json`; a.click(); toast("📤 Exported","ok"); };
-  const doImport = e => { const f=e.target.files?.[0]; if(!f) return; const r=new FileReader(); r.onload=ev=>{try{const d=JSON.parse(ev.target.result);if(d.items){setItems(d.items);setShopList(d.shop||[]);toast(`📥 Imported ${d.items.length} items`,"ok");}else toast("❌ Invalid","danger");}catch{toast("❌ Error","danger");}};r.readAsText(f);e.target.value=""; };
+  const doExport = async () => {
+    const text = JSON.stringify({ items, shop:shopList }, null, 2);
+    const name = `consumables-${localISO()}.json`;
+    try {   // phones: native share sheet (Save to Files, AirDrop, Drive…)
+      const file = new File([text], name, { type:"application/json" });
+      if (navigator.canShare?.({ files:[file] })) { await navigator.share({ files:[file], title:"Consumables backup" }); return toast("📤 Exported","ok"); }
+    } catch (e) { if (e?.name === "AbortError") return; }
+    const url = URL.createObjectURL(new Blob([text], { type:"application/json" }));
+    const a = document.createElement("a"); a.href = url; a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast("📤 Exported","ok");
+  };
+  const doImport = e => {
+    const f=e.target.files?.[0]; if(!f) return;
+    const r=new FileReader();
+    r.onload=ev=>{
+      try {
+        const d=JSON.parse(ev.target.result);
+        if (!Array.isArray(d.items)) return toast("❌ Invalid backup file","danger");
+        const now=Date.now();
+        // Merge by item id: newer edit wins, so importing an older backup can't clobber newer changes.
+        const have=new Map(itemsRef.current.map(x=>[x.id,x]));
+        const incoming=d.items.filter(x=>x&&typeof x.name==="string"&&x.name.trim()).map(x=>({ ...x, id:x.id??nid(), u:Math.max(x.u||0,now) }));
+        incoming.forEach(x=>have.set(x.id,x));
+        const next=[...have.values()];
+        itemsRef.current=next; setItems(next);
+        setTomb(tombRef.current=tombRef.current.filter(t=>!have.has(t.id)));
+        if (Array.isArray(d.shop) && d.shop.length) updateShop(d.shop);
+        toast(`📥 Imported ${incoming.length} items`,"ok");
+      } catch { toast("❌ Couldn't read that file","danger"); }
+    };
+    r.readAsText(f); e.target.value="";
+  };
 
   // ── Render ─────────────────────────────────────────────────────────────────
+  if (locked) return <LockScreen onUnlock={unlock}/>;
+  const syncDot = { synced:"#10b981", saving:"#60a5fa", loading:"#60a5fa", offline:"#f59e0b", error:"#ef4444", locked:"#ef4444" }[syncStatus] || "#5a7898";
+
   return (
     <div style={st.root}>
       <div style={st.grain}/>
       <Toast list={toasts}/>
+
+      {showSettings && (
+        <SettingsModal syncStatus={syncStatus} toast={toast} onClose={()=>setShowSettings(false)}
+          onExport={doExport} onImport={()=>importRef.current?.click()}
+          onRestore={()=>window.location.reload()} />
+      )}
+      <input ref={importRef} type="file" accept=".json" style={{ display:"none" }} onChange={doImport}/>
 
       {/* Delete confirm */}
       {delItem && (
         <Modal onClose={()=>setDelItem(null)}>
           <p style={{ fontSize:14, color:"#c8d8ee", marginBottom:18 }}>Remove <b>{delItem.name}</b>?</p>
           <div style={{ display:"flex", gap:10 }}>
-            <button style={{ ...st.btnRed, flex:1 }} onClick={()=>{ setItems(p=>p.filter(x=>x.id!==delItem.id)); setDelItem(null); toast("🗑 Removed","info"); }}>Yes, remove</button>
+            <button style={{ ...st.btnRed, flex:1 }} onClick={()=>{ removeItem(delItem.id); setDelItem(null); toast("🗑 Removed","info"); }}>Yes, remove</button>
             <button style={{ ...st.btnGhost, flex:1 }} onClick={()=>setDelItem(null)}>Cancel</button>
           </div>
         </Modal>
@@ -605,7 +716,7 @@ export default function App() {
       {/* Edit modal */}
       {editItem && (
         <Modal onClose={()=>setEditItem(null)}>
-          <EditForm item={editItem} onSave={updated=>{ setItems(p=>p.map(x=>x.id===updated.id?updated:x)); setEditItem(null); toast("✏️ Updated","info"); alertLow([updated]); }} onCancel={()=>setEditItem(null)} />
+          <EditForm item={editItem} onSave={updated=>{ const saved=updateItem(updated.id, updated); setEditItem(null); toast("✏️ Updated","info"); if(saved) alertLow([saved]); }} onCancel={()=>setEditItem(null)} />
         </Modal>
       )}
 
@@ -638,23 +749,11 @@ export default function App() {
         <div style={{ display:"flex", gap:5, alignItems:"center" }}>
           <div style={st.pill}><b style={st.pN}>{items.length}</b><span style={st.pL}>items</span></div>
           {lowCount>0 && <div style={{ ...st.pill, background:"rgba(245,158,11,.1)", border:"1px solid rgba(245,158,11,.25)" }}><b style={st.pN}>{lowCount}</b><span style={st.pL}>low⚠️</span></div>}
-          <button style={st.hbtn} onClick={doExport}>📤</button>
-          <button style={st.hbtn} onClick={()=>importRef.current?.click()}>📥</button>
-          <input ref={importRef} type="file" accept=".json" style={{ display:"none" }} onChange={doImport}/>
+          <button style={{ ...st.hbtn, position:"relative" }} aria-label="Settings and sync" onClick={()=>setShowSettings(true)}>
+            ⚙️<span style={{ position:"absolute", top:5, right:5, width:9, height:9, borderRadius:"50%", background:syncDot, border:"1.5px solid #07101e" }}/>
+          </button>
         </div>
       </header>
-
-      {/* Tabs */}
-      <nav style={st.nav}>
-        {[{id:"home",icon:"📊",label:"Home"},{id:"chat",icon:"💬",label:"Chat"},{id:"scan",icon:"📷",label:"Scan"},{id:"items",icon:"📦",label:"Items"},{id:"shop",icon:"🛒",label:"Shop"}].map(t=>(
-          <button key={t.id} style={{ ...st.tab, ...(tab===t.id?st.tabOn:{}) }} onClick={()=>setTab(t.id)}>
-            <span style={{ fontSize:16 }}>{t.icon}</span>
-            <span style={st.tabLbl}>{t.label}</span>
-            {t.id==="items" && lowCount>0 && <span style={{ ...st.dot, background:"#f59e0b" }}>{lowCount}</span>}
-            {t.id==="shop"  && shopList.length>0 && <span style={st.dot}>{shopList.length}</span>}
-          </button>
-        ))}
-      </nav>
 
       <main style={st.main}>
 
@@ -743,11 +842,15 @@ export default function App() {
                 Point your camera at a <b style={{ color:"#93c5fd" }}>product label or packaging</b>. AI will automatically read and categorize it.
               </p>
               <button style={st.bigBtn} onClick={()=>fileRef.current?.click()}>
-                📷 Open Camera / Upload Photo
+                📷 Take Photo
+              </button>
+              <button style={st.outBtn} onClick={()=>galleryRef.current?.click()}>
+                🖼️ Choose from Library
               </button>
               <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{ display:"none" }} onChange={handleFile}/>
+              <input ref={galleryRef} type="file" accept="image/*" style={{ display:"none" }} onChange={handleFile}/>
               <div style={{ display:"flex", gap:6, flexWrap:"wrap", justifyContent:"center" }}>
-                {["✅ Product labels","✅ Barcodes","✅ Packaging","✅ Bottles"].map(h=>(
+                {["✅ Product labels","✅ Packaging","✅ Bottles","✅ Boxes & bags"].map(h=>(
                   <span key={h} style={{ background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.07)", borderRadius:7, padding:"4px 9px", fontSize:10, color:"#5a7898" }}>{h}</span>
                 ))}
               </div>
@@ -842,7 +945,7 @@ export default function App() {
                       {isOut && <div style={{ fontSize:9, fontWeight:700, color:"#f87171", background:"rgba(239,68,68,.12)", borderRadius:5, padding:"2px 6px", display:"inline-block", marginBottom:4 }}>🚨 OUT</div>}
                       {!isOut&&isLow && <div style={{ fontSize:9, fontWeight:700, color:"#fbbf24", background:"rgba(245,158,11,.12)", borderRadius:5, padding:"2px 6px", display:"inline-block", marginBottom:4 }}>⚠️ LOW</div>}
                       {isExp && <div style={{ fontSize:9, color:"#fca5a5", marginBottom:4 }}>⏰ Exp {item.expiry}</div>}
-                      <Stepper value={item.qty} onChange={v=>{ setItems(p=>{ const n=p.map(x=>x.id===item.id?{...x,qty:v}:x); alertLow(n.filter(x=>x.id===item.id)); return n; }); }}/>
+                      <Stepper value={item.qty} onChange={v=>{ const saved=updateItem(item.id, { qty:v }); if(saved) alertLow([saved]); }}/>
                       <div style={{ textAlign:"center", fontSize:10, color:"#4a6585", marginTop:3 }}>{item.unit}</div>
                     </div>
                   );
@@ -853,14 +956,27 @@ export default function App() {
         )}
 
         {/* ── SHOP ── */}
-        {tab==="shop" && <ShopTab items={items} shopList={shopList} setShopList={setShopList} />}
+        {tab==="shop" && <ShopTab items={items} shopList={shopList} setShopList={updateShop} />}
 
       </main>
 
+      {/* Tabs — bottom bar so they sit under the thumb */}
+      <nav style={st.nav} aria-label="Main">
+        {[{id:"home",icon:"📊",label:"Home"},{id:"chat",icon:"💬",label:"Chat"},{id:"scan",icon:"📷",label:"Scan"},{id:"items",icon:"📦",label:"Items"},{id:"shop",icon:"🛒",label:"Shop"}].map(t=>(
+          <button key={t.id} style={{ ...st.tab, ...(tab===t.id?st.tabOn:{}) }} aria-current={tab===t.id?"page":undefined} onClick={()=>setTab(t.id)}>
+            <span style={{ fontSize:20 }}>{t.icon}</span>
+            <span style={st.tabLbl}>{t.label}</span>
+            {t.id==="items" && lowCount>0 && <span style={{ ...st.dot, background:"#f59e0b" }}>{lowCount}</span>}
+            {t.id==="shop"  && shopList.length>0 && <span style={st.dot}>{shopList.length}</span>}
+          </button>
+        ))}
+      </nav>
+
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&display=swap');
         *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-        body{font-family:'Sora',sans-serif;-webkit-tap-highlight-color:transparent}
+        html,body,#root{height:100%}
+        body{font-family:'Sora',system-ui,-apple-system,sans-serif;-webkit-tap-highlight-color:transparent;overscroll-behavior-y:none;background:#07101e;-webkit-text-size-adjust:100%}
+        button{touch-action:manipulation}
         input,select,button{font-family:inherit}
         ::-webkit-scrollbar{width:3px}::-webkit-scrollbar-thumb{background:#1a2e4a;border-radius:4px}
         input[type=date]{color-scheme:dark}
@@ -881,22 +997,22 @@ export default function App() {
 // ─── Styles ────────────────────────────────────────────────────────────────────
 const BG="#07101e", PANEL="#0c1828", BORD="rgba(255,255,255,0.07)", TXT="#e2eaf5", MUT="#5a7898";
 const st = {
-  root:{ fontFamily:"'Sora',sans-serif", background:`linear-gradient(155deg,${BG} 0%,#0d1a2e 55%,${BG} 100%)`, minHeight:"100vh", color:TXT, display:"flex", flexDirection:"column", maxWidth:500, margin:"0 auto", position:"relative", overflow:"hidden" },
+  root:{ fontFamily:"'Sora',system-ui,-apple-system,sans-serif", background:`linear-gradient(155deg,${BG} 0%,#0d1a2e 55%,${BG} 100%)`, height:"100%", color:TXT, display:"flex", flexDirection:"column", maxWidth:500, margin:"0 auto", position:"relative", overflow:"hidden", paddingLeft:"env(safe-area-inset-left)", paddingRight:"env(safe-area-inset-right)" },
   grain:{ position:"fixed", inset:0, opacity:.015, backgroundImage:"url(\"data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E\")", pointerEvents:"none", zIndex:0 },
-  main:{ flex:1, overflowY:"auto", position:"relative", zIndex:1 },
-  hdr:{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"13px 13px 10px", borderBottom:`1px solid ${BORD}`, position:"relative", zIndex:1 },
+  main:{ flex:1, minHeight:0, overflowY:"auto", WebkitOverflowScrolling:"touch", overscrollBehavior:"contain", position:"relative", zIndex:1 },
+  hdr:{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"calc(13px + env(safe-area-inset-top)) 13px 10px", borderBottom:`1px solid ${BORD}`, position:"relative", zIndex:1, flexShrink:0 },
   logo:{ width:38, height:38, borderRadius:11, background:"linear-gradient(135deg,#1a3a62,#2563eb)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:20, flexShrink:0, boxShadow:"0 0 14px rgba(37,99,235,.3)" },
   appName:{ fontSize:17, fontWeight:700, letterSpacing:"-.4px" },
   appSub:{ fontSize:9, color:MUT, textTransform:"uppercase", letterSpacing:".8px" },
-  hbtn:{ width:32, height:32, background:"rgba(255,255,255,.05)", border:`1px solid ${BORD}`, borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center", fontSize:14, cursor:"pointer", flexShrink:0 },
+  hbtn:{ width:40, height:40, background:"rgba(255,255,255,.05)", border:`1px solid ${BORD}`, borderRadius:8, display:"flex", alignItems:"center", justifyContent:"center", fontSize:14, cursor:"pointer", flexShrink:0 },
   pill:{ background:"rgba(255,255,255,.04)", border:`1px solid ${BORD}`, borderRadius:8, padding:"3px 9px", textAlign:"center" },
   pN:{ display:"block", fontSize:14, fontWeight:700, lineHeight:1 },
   pL:{ display:"block", fontSize:8, color:MUT, marginTop:1 },
-  nav:{ display:"flex", borderBottom:`1px solid ${BORD}`, zIndex:1 },
-  tab:{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:2, padding:"8px 2px", background:"transparent", border:"none", color:"#3a5575", cursor:"pointer", position:"relative" },
-  tabOn:{ color:"#60a5fa", borderBottom:"2px solid #60a5fa" },
-  tabLbl:{ fontSize:9, fontWeight:500 },
-  dot:{ position:"absolute", top:5, right:"calc(50% - 20px)", background:"#ef4444", color:"#fff", fontSize:8, fontWeight:700, borderRadius:999, padding:"1px 4px", minWidth:13, textAlign:"center" },
+  nav:{ display:"flex", borderTop:`1px solid ${BORD}`, background:"rgba(7,16,30,.96)", zIndex:2, flexShrink:0, paddingBottom:"env(safe-area-inset-bottom)" },
+  tab:{ flex:1, minHeight:56, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:2, padding:"6px 2px", background:"transparent", border:"none", borderTop:"2px solid transparent", color:"#6b87a8", cursor:"pointer", position:"relative" },
+  tabOn:{ color:"#60a5fa", borderTop:"2px solid #60a5fa" },
+  tabLbl:{ fontSize:10, fontWeight:500 },
+  dot:{ position:"absolute", top:4, right:"calc(50% - 24px)", background:"#ef4444", color:"#fff", fontSize:8, fontWeight:700, borderRadius:999, padding:"1px 4px", minWidth:13, textAlign:"center" },
   btnGreen:{ padding:"11px 16px", background:"linear-gradient(135deg,#059669,#10b981)", color:"#fff", border:"none", borderRadius:10, fontSize:13, fontWeight:600, cursor:"pointer" },
   btnBlue:{ padding:"11px 16px", background:"linear-gradient(135deg,#1d4ed8,#3b82f6)", color:"#fff", border:"none", borderRadius:10, fontSize:13, fontWeight:600, cursor:"pointer" },
   btnRed:{ padding:"11px 16px", background:"linear-gradient(135deg,#b91c1c,#ef4444)", color:"#fff", border:"none", borderRadius:10, fontSize:13, fontWeight:600, cursor:"pointer" },
@@ -906,10 +1022,10 @@ const st = {
   lbtn:{ background:"none", border:"none", color:"#60a5fa", fontSize:12, cursor:"pointer", padding:0, marginTop:8 },
   tinyBtn:{ background:"rgba(255,255,255,.04)", border:`1px solid ${BORD}`, borderRadius:7, padding:"4px 8px", fontSize:10, color:MUT, cursor:"pointer" },
   chipBtn:{ background:"rgba(37,99,235,.12)", border:"1px solid rgba(96,165,250,.2)", borderRadius:7, padding:"3px 8px", fontSize:11, color:"#60a5fa", cursor:"pointer", flexShrink:0 },
-  mb:{ background:"none", border:"none", fontSize:13, cursor:"pointer", opacity:.55, padding:2 },
-  inp:{ width:"100%", background:"rgba(255,255,255,.05)", border:`1px solid rgba(255,255,255,.1)`, borderRadius:9, padding:"8px 11px", color:TXT, fontSize:13, outline:"none" },
-  sb:{ width:28, height:28, borderRadius:7, background:"rgba(255,255,255,.07)", border:`1px solid ${BORD}`, color:TXT, fontSize:17, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 },
-  chatWrap:{ display:"flex", flexDirection:"column", height:"calc(100vh - 140px)" },
+  mb:{ background:"none", border:"none", fontSize:16, cursor:"pointer", opacity:.7, padding:"8px 9px", minWidth:36, minHeight:36 },
+  inp:{ width:"100%", background:"rgba(255,255,255,.05)", border:`1px solid rgba(255,255,255,.1)`, borderRadius:9, padding:"10px 12px", color:TXT, fontSize:16, outline:"none" },
+  sb:{ width:38, height:38, borderRadius:7, background:"rgba(255,255,255,.07)", border:`1px solid ${BORD}`, color:TXT, fontSize:17, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 },
+  chatWrap:{ display:"flex", flexDirection:"column", height:"100%" },
   chatScroll:{ flex:1, overflowY:"auto", padding:"12px 12px 6px" },
   qchip:{ background:"rgba(37,99,235,.1)", border:"1px solid rgba(96,165,250,.2)", borderRadius:20, padding:"5px 11px", fontSize:11, color:"#93c5fd", cursor:"pointer" },
   bubble:{ display:"flex", gap:7, marginBottom:10, animation:"fadeUp .3s ease" },
@@ -919,8 +1035,8 @@ const st = {
   bubText:{ background:"rgba(255,255,255,.04)", border:`1px solid ${BORD}`, borderRadius:"4px 11px 11px 11px", padding:"8px 12px", fontSize:13, lineHeight:1.65, maxWidth:"82%" },
   bubTextU:{ background:"linear-gradient(135deg,#1d4ed8,#3b82f6)", border:"none", borderRadius:"11px 4px 11px 11px", color:"#ddeeff" },
   chatBar:{ display:"flex", gap:7, padding:"9px 12px", borderTop:`1px solid ${BORD}`, background:"rgba(0,0,0,.3)" },
-  chatIn:{ flex:1, background:"rgba(255,255,255,.05)", border:`1px solid rgba(255,255,255,.09)`, borderRadius:10, padding:"8px 12px", color:TXT, fontSize:13, outline:"none" },
-  sendBtn:{ width:38, height:38, borderRadius:10, background:"linear-gradient(135deg,#1d4ed8,#3b82f6)", border:"none", color:"#fff", fontSize:14, cursor:"pointer", flexShrink:0, fontWeight:700 },
+  chatIn:{ flex:1, background:"rgba(255,255,255,.05)", border:`1px solid rgba(255,255,255,.09)`, borderRadius:10, padding:"10px 12px", color:TXT, fontSize:16, outline:"none" },
+  sendBtn:{ width:44, height:44, borderRadius:10, background:"linear-gradient(135deg,#1d4ed8,#3b82f6)", border:"none", color:"#fff", fontSize:14, cursor:"pointer", flexShrink:0, fontWeight:700 },
   scanWrap:{ padding:22, display:"flex", flexDirection:"column", alignItems:"center", gap:14, minHeight:"70vh", overflowY:"auto" },
   scanRing:{ width:80, height:80, borderRadius:"50%", background:"rgba(37,99,235,.1)", border:"2px solid rgba(96,165,250,.15)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:36 },
   spinner:{ width:40, height:40, border:"3px solid rgba(255,255,255,.07)", borderTop:"3px solid #60a5fa", borderRadius:"50%", animation:"spin .8s linear infinite" },

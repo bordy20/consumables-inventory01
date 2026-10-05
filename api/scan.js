@@ -1,42 +1,47 @@
+import { kv } from "@vercel/kv";
+import { gate, rateLimit, clientIp, callClaude, cleanScan, CATS, UNITS } from "../server/lib.js";
+
+export const config = { api: { bodyParser: { sizeLimit: "3mb" } } };
+
+const B64_RE = /^[A-Za-z0-9+/=]+$/;
+
 export default async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  const uid = gate(req, res, ["POST"]);
+  if (!uid) return;
 
-  const { image } = req.body || {};
-  if (!image) return res.status(400).json({ error: "No image provided" });
+  const image = req.body?.image;
+  // Client compresses to ~800px JPEG (well under 1.5 MB base64).
+  if (typeof image !== "string" || image.length < 100 || image.length > 2_000_000 || !B64_RE.test(image)) {
+    return res.status(400).json({ error: "Invalid image" });
+  }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: "API key not configured" });
+  if (!(await rateLimit(kv, "ai-ip", clientIp(req), 40, 3600)) ||
+      !(await rateLimit(kv, "scan", uid, 30, 3600))) {
+    return res.status(429).json({ error: "Scan limit reached, try again later" });
+  }
 
   try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 500,
-        messages: [{
-          role: "user",
-          content: [
-            { type: "image", source: { type: "base64", media_type: "image/jpeg", data: image } },
-            { type: "text", text: `Identify this household consumable product. Return ONLY raw JSON, no markdown:\n{"name":"product name","brand":"brand or empty","category":"Oral Care|Toilet Paper|Personal Care|Cleaning|Food & Beverage|Medicine|Other","unit":"piece|pack|bottle|tube|roll|bar|box|can|bag|sachet","emoji":"one emoji","notes":"one tip or empty"}\nIf not a household product: {"error":"not a product"}` }
-          ]
-        }]
-      }),
+    const data = await callClaude({
+      max_tokens: 400,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: "image/jpeg", data: image } },
+          { type: "text", text:
+`Identify this household consumable product. Return ONLY raw JSON, no markdown:
+{"name":"product name","brand":"brand or empty","category":"${CATS.join("|")}","unit":"${UNITS.join("|")}","emoji":"one emoji","notes":"one short tip or empty"}
+If it is not a household product: {"error":"not a product"}` },
+        ],
+      }],
     });
-    const data = await response.json();
     const text = data?.content?.[0]?.text || "";
     const match = text.match(/\{[\s\S]*\}/);
     if (!match) return res.status(200).json({ error: "parse failed" });
-    return res.status(200).json(JSON.parse(match[0]));
+    let parsed; try { parsed = JSON.parse(match[0]); } catch { return res.status(200).json({ error: "parse failed" }); }
+    const clean = cleanScan(parsed);
+    return res.status(200).json(clean || { error: "not a product" });
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    console.error("scan error:", err.message);
+    return res.status(err.status || 500).json({ error: "Scan failed" });
   }
 }
